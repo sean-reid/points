@@ -667,6 +667,30 @@ fn find_shortest_equivalence(
                         if existing.as_ref() != expr.as_ref() 
                             && !are_structurally_equivalent(existing, &expr) {
                             
+                            // Reject if both sides are constants (like 0 = 0)
+                            if matches!(existing.as_ref(), Expr::Const(_)) && matches!(expr.as_ref(), Expr::Const(_)) {
+                                continue;
+                            }
+                            
+                            // Reject if both expressions evaluate to the same constant on all points
+                            // (e.g., 0 = 0/(x+y+z) where both always equal 0)
+                            let existing_vals: Vec<_> = points.iter()
+                                .filter_map(|p| eval(existing, p, var_map))
+                                .collect();
+                            let expr_vals: Vec<_> = points.iter()
+                                .filter_map(|p| eval(&expr, p, var_map))
+                                .collect();
+                            
+                            if !existing_vals.is_empty() && !expr_vals.is_empty() {
+                                let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-10);
+                                let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-10);
+                                
+                                if existing_constant && expr_constant {
+                                    // Both are constant - skip this trivial equivalence
+                                    continue;
+                                }
+                            }
+                            
                             // Check total size FIRST before any expensive operations
                             let total_size = existing.size() + expr.size();
                             if total_size > max_total_size {
@@ -739,6 +763,28 @@ fn find_shortest_equivalence(
                                 if let Some(existing) = value_to_expr.get(&norm) {
                                     if existing.as_ref() != expr.as_ref()
                                         && !are_structurally_equivalent(existing, &expr) {
+                                        
+                                        // Reject if both sides are constants (like 0 = 0)
+                                        if matches!(existing.as_ref(), Expr::Const(_)) && matches!(expr.as_ref(), Expr::Const(_)) {
+                                            continue;
+                                        }
+                                        
+                                        // Reject if both expressions evaluate to the same constant on all points
+                                        let existing_vals: Vec<_> = points.iter()
+                                            .filter_map(|p| eval(existing, p, var_map))
+                                            .collect();
+                                        let expr_vals: Vec<_> = points.iter()
+                                            .filter_map(|p| eval(&expr, p, var_map))
+                                            .collect();
+                                        
+                                        if !existing_vals.is_empty() && !expr_vals.is_empty() {
+                                            let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-10);
+                                            let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-10);
+                                            
+                                            if existing_constant && expr_constant {
+                                                continue;
+                                            }
+                                        }
                                         
                                         // Check total size FIRST before any expensive operations
                                         let total_size = existing.size() + expr.size();
