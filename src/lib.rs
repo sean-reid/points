@@ -257,13 +257,23 @@ fn eval(expr: &Expr, point: &Point, var_map: &BTreeMap<char, usize>) -> Option<f
         Expr::Div(l, r) => {
             let lv = eval(l, point, var_map)?;
             let rv = eval(r, point, var_map)?;
-            if rv.abs() < 1e-10 { None } else { Some(lv / rv) }
+            if rv.abs() < 1e-15 { None } else { Some(lv / rv) }
         }
         Expr::Pow(l, r) => {
             let lv = eval(l, point, var_map)?;
             let rv = eval(r, point, var_map)?;
+            
+            // Reject extreme exponents to avoid numerical artifacts
+            if rv.abs() > 20.0 {
+                return None;
+            }
+            
             let result = lv.powf(rv);
-            if result.is_finite() && result.abs() < 1e10 { Some(result) } else { None }
+            if result.is_finite() && result.abs() < 1e10 && result.abs() > 1e-10 { 
+                Some(result) 
+            } else { 
+                None 
+            }
         }
     }
 }
@@ -279,7 +289,7 @@ fn compute_value_vector(
 }
 
 fn normalize_vector(vec: &ValueVector) -> Vec<i64> {
-    const SCALE: f64 = 1e6;
+    const SCALE: f64 = 1e12; // Much higher precision
     vec.iter().map(|&v| (v * SCALE).round() as i64).collect()
 }
 
@@ -778,11 +788,19 @@ fn find_shortest_equivalence(
                                             .collect();
                                         
                                         if !existing_vals.is_empty() && !expr_vals.is_empty() {
-                                            let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-10);
-                                            let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-10);
+                                            let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-15);
+                                            let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-15);
                                             
                                             if existing_constant && expr_constant {
                                                 continue;
+                                            }
+                                            
+                                            // Also reject if either expression has extreme values (numerical artifacts)
+                                            let has_extreme_existing = existing_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
+                                            let has_extreme_expr = expr_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
+                                            
+                                            if has_extreme_existing || has_extreme_expr {
+                                                continue; // Skip numerical artifacts
                                             }
                                         }
                                         
