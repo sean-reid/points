@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Points</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #fafafa;
+            color: #333;
+            padding: 40px 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #111;
+        }
+
+        .subtitle {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 40px;
+        }
+
+        .section {
+            margin-bottom: 32px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #444;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 13px;
+            resize: vertical;
+            background: white;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #888;
+        }
+
+        .controls {
+            display: flex;
+            gap: 16px;
+            align-items: flex-end;
+        }
+
+        .controls > div {
+            flex: 1;
+        }
+
+        input[type="number"] {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            background: white;
+        }
+
+        input[type="number"]:focus {
+            outline: none;
+            border-color: #888;
+        }
+
+        button {
+            background: #111;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #333;
+        }
+
+        button:active {
+            background: #000;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .results {
+            margin-top: 40px;
+            padding-top: 32px;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .results.hidden {
+            display: none;
+        }
+
+        .search-status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 16px;
+            background: #f5f5f5;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        .search-status.hidden {
+            display: none;
+        }
+
+        .status-spinner {
+            width: 20px;
+            height: 20px;
+            border: 3px solid #e0e0e0;
+            border-radius: 50%;
+            border-top-color: #111;
+            animation: spin 0.8s linear infinite;
+        }
+
+        .result-box {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            padding: 16px;
+        }
+
+        .result-box.success {
+            border-color: #4a9d5f;
+            background: #f8fdf9;
+        }
+
+        .result-box.error {
+            border-color: #d47373;
+            background: #fef8f8;
+        }
+
+        .result-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            margin-bottom: 8px;
+        }
+
+        .result-expression {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 18px;
+            color: #111;
+            margin-bottom: 12px;
+        }
+
+        .error-display {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #e0e0e0;
+            font-size: 13px;
+        }
+
+        .error-header {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            margin-bottom: 6px;
+        }
+
+        .error-note {
+            font-size: 11px;
+            color: #999;
+            font-style: italic;
+            margin-bottom: 6px;
+        }
+
+        .error-item {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            color: #666;
+            margin: 3px 0;
+        }
+
+        .error-item.max-error {
+            margin-top: 8px;
+            font-weight: 600;
+            color: #444;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Find an expression that intersects all points</h1>
+        <p class="subtitle">Finds f = g using +, -, *, /, ^ and constants 0-9</p>
+
+        <div class="section">
+            <label for="points">Points (one per line, space-separated)</label>
+            <textarea id="points" rows="6">4 3 1
+1 2 3
+3 5 1</textarea>
+        </div>
+
+        <div class="section">
+            <div class="controls">
+                <div>
+                    <label for="maxSize">Max total length</label>
+                    <input type="number" id="maxSize" value="12" min="2" max="30">
+                </div>
+                <div>
+                    <button id="searchBtn" onclick="runSearch()">
+                        Search
+                        <span id="loadingSpinner" class="loading hidden"></span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div id="resultsSection" class="results hidden">
+            <div id="searchStatus" class="search-status hidden">
+                <div class="status-spinner"></div>
+                <div id="statusText">Searching...</div>
+            </div>
+            <div id="resultContent"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { search_equivalence } from './pkg/points.js';
+
+        let wasmInitialized = false;
+
+        async function initWasm() {
+            if (!wasmInitialized) {
+                await init();
+                wasmInitialized = true;
+            }
+        }
+
+        window.runSearch = async function() {
+            const pointsText = document.getElementById('points').value;
+            const maxSize = parseInt(document.getElementById('maxSize').value);
+            const searchBtn = document.getElementById('searchBtn');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+            const resultsSection = document.getElementById('resultsSection');
+            const resultContent = document.getElementById('resultContent');
+            const searchStatus = document.getElementById('searchStatus');
+            const statusText = document.getElementById('statusText');
+
+            resultContent.innerHTML = '';
+            resultsSection.classList.remove('hidden');
+            searchStatus.classList.remove('hidden');
+            statusText.textContent = 'Searching...';
+
+            searchBtn.disabled = true;
+            loadingSpinner.classList.remove('hidden');
+
+            // Force UI update before starting WASM
+            await new Promise(resolve => setTimeout(resolve, 10));
+
+            try {
+                await initWasm();
+
+                let currentTarget = 0;
+                const logCallback = (msg) => {
+                    // Update status text with current search progress
+                    if (msg.startsWith('Searching for equivalences with total size <=')) {
+                        const match = msg.match(/\d+/);
+                        if (match) {
+                            currentTarget = parseInt(match[0]);
+                            statusText.textContent = `Searching for expressions with total length ≤ ${currentTarget}...`;
+                        }
+                    }
+                };
+
+                const result = search_equivalence(pointsText, maxSize, logCallback);
+
+                searchStatus.classList.add('hidden');
+
+                if (result.found) {
+                    const totalLength = result.f_size + result.g_size;
+                    const errors = result.errors;
+                    const maxError = Math.max(...errors);
+                    
+                    let errorHtml = '';
+                    if (errors.length > 0) {
+                        errorHtml = '<div class="error-display">';
+                        errorHtml += '<div class="error-header">Verification</div>';
+                        errorHtml += '<div class="error-note">|f(point) - g(point)| at each input point</div>';
+                        errors.forEach((err, idx) => {
+                            const formatted = err < 1e-10 ? '0' : err.toExponential(2);
+                            errorHtml += `<div class="error-item">Point ${idx + 1}: ${formatted}</div>`;
+                        });
+                        errorHtml += `<div class="error-item max-error">Max error: ${maxError < 1e-10 ? '0' : maxError.toExponential(2)}</div>`;
+                        errorHtml += '</div>';
+                    }
+                    
+                    resultContent.innerHTML = `
+                        <div class="result-box success">
+                            <div class="result-label">Total Length: ${totalLength}</div>
+                            <div class="result-expression">${result.f_expr} = ${result.g_expr}</div>
+                            ${errorHtml}
+                        </div>
+                    `;
+                } else {
+                    resultContent.innerHTML = `
+                        <div class="result-box error">
+                            No equivalence found up to size ${maxSize}
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                resultContent.innerHTML = `
+                    <div class="result-box error">
+                        Error: ${error.message}
+                    </div>
+                `;
+                console.error(error);
+            } finally {
+                searchBtn.disabled = false;
+                loadingSpinner.classList.add('hidden');
+            }
+        };
+
+        initWasm();
+    </script>
+</body>
+</html>

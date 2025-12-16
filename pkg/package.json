@@ -1,0 +1,15 @@
+{
+  "name": "points",
+  "type": "module",
+  "version": "2.0.0",
+  "files": [
+    "points_bg.wasm",
+    "points.js",
+    "points.d.ts"
+  ],
+  "main": "points.js",
+  "types": "points.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
