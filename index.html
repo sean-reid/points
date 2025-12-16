@@ -274,6 +274,7 @@
         import init, { search_equivalence } from './pkg/points.js';
 
         let wasmInitialized = false;
+        let searchInProgress = false;
 
         async function initWasm() {
             if (!wasmInitialized) {
@@ -283,6 +284,12 @@
         }
 
         window.runSearch = async function() {
+            // Prevent multiple simultaneous searches
+            if (searchInProgress) {
+                return;
+            }
+            searchInProgress = true;
+
             const pointsText = document.getElementById('points').value;
             const maxSize = parseInt(document.getElementById('maxSize').value);
             const searchBtn = document.getElementById('searchBtn');
@@ -300,8 +307,12 @@
             searchBtn.disabled = true;
             loadingSpinner.classList.remove('hidden');
 
-            // Force UI update before starting WASM
-            await new Promise(resolve => setTimeout(resolve, 10));
+            // Multiple strategies to ensure UI updates
+            await new Promise(resolve => requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    setTimeout(resolve, 0);
+                });
+            }));
 
             try {
                 await initWasm();
@@ -364,6 +375,7 @@
             } finally {
                 searchBtn.disabled = false;
                 loadingSpinner.classList.add('hidden');
+                searchInProgress = false;
             }
         };
 
