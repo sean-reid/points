@@ -402,7 +402,7 @@ fn use_all_variables(e1: &Expr, e2: &Expr, required_vars: &BTreeSet<char>) -> bo
     required_vars.iter().all(|v| all_vars.contains(v))
 }
 
-fn are_algebraically_equivalent(e1: &Expr, e2: &Expr, _var_map: &BTreeMap<char, usize>) -> bool {
+fn are_algebraically_equivalent(e1: &Expr, e2: &Expr, var_map: &BTreeMap<char, usize>) -> bool {
     let canon1 = to_canonical_form(e1);
     let canon2 = to_canonical_form(e2);
     
@@ -415,11 +415,32 @@ fn are_algebraically_equivalent(e1: &Expr, e2: &Expr, _var_map: &BTreeMap<char, 
     if both_valid {
         canon1 == canon2
     } else {
-        match (&canon1, &canon2) {
-            (CanonicalExpr::Sum(v1), CanonicalExpr::Sum(v2)) => {
-                v1.is_empty() && v2.is_empty()
+        // If canonicalization failed, fall back to evaluating on test points
+        // to detect simple algebraic equivalences
+        let test_points = vec![
+            vec![1.0; var_map.len()],
+            vec![2.0; var_map.len()],
+            vec![3.0; var_map.len()],
+            (0..var_map.len()).map(|i| (i + 1) as f64).collect::<Vec<_>>(),
+        ];
+        
+        for test_point in test_points {
+            let val1 = eval(e1, &test_point, var_map);
+            let val2 = eval(e2, &test_point, var_map);
+            
+            match (val1, val2) {
+                (Some(v1), Some(v2)) => {
+                    if (v1 - v2).abs() > 1e-10 {
+                        return false; // Different on this test point
+                    }
+                }
+                (None, None) => continue,
+                _ => return false,
             }
         }
+        
+        // If they match on all test points, likely equivalent
+        true
     }
 }
 
