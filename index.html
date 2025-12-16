@@ -279,7 +279,6 @@
             if (!worker) {
                 try {
                     worker = new Worker('./worker.js', { type: 'module' });
-                    console.log('Web Worker initialized');
                 } catch (e) {
                     console.error('Failed to create Web Worker:', e);
                     throw new Error('Web Worker not supported or worker.js not found');
@@ -321,6 +320,8 @@
                         const { type, message, result } = e.data;
                         
                         if (type === 'log') {
+                            console.log('[WASM]', message); // Log to console
+                            
                             // Update status text with current search progress
                             if (message.startsWith('Searching for equivalences with total size <=')) {
                                 const match = message.match(/\d+/);

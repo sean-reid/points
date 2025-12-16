@@ -2,7 +2,57 @@ use std::collections::{HashMap, BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
-// Expression AST with hash-consing for DAG representation
+// Log levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+}
+
+// Compile-time log level (change this to control verbosity)
+const COMPILE_LOG_LEVEL: LogLevel = LogLevel::Error;
+
+// Logging wrapper
+struct Logger<'a> {
+    callback: &'a dyn Fn(String),
+}
+
+impl<'a> Logger<'a> {
+    fn new(callback: &'a dyn Fn(String)) -> Self {
+        Logger { callback }
+    }
+    
+    fn log(&self, level: LogLevel, msg: String) {
+        if level >= COMPILE_LOG_LEVEL {
+            let prefix = match level {
+                LogLevel::Debug => "[DEBUG]",
+                LogLevel::Info => "[INFO]",
+                LogLevel::Warn => "[WARN]",
+                LogLevel::Error => "[ERROR]",
+            };
+            (self.callback)(format!("{} {}", prefix, msg));
+        }
+    }
+    
+    fn debug(&self, msg: String) {
+        self.log(LogLevel::Debug, msg);
+    }
+    
+    fn info(&self, msg: String) {
+        self.log(LogLevel::Info, msg);
+    }
+    
+    fn warn(&self, msg: String) {
+        self.log(LogLevel::Warn, msg);
+    }
+    
+    fn error(&self, msg: String) {
+        self.log(LogLevel::Error, msg);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Expr {
     Var(char),
@@ -81,7 +131,6 @@ impl Expr {
     }
 }
 
-// Hash-consing table for DAG representation
 #[derive(Default)]
 struct ExprInterner {
     cache: HashMap<Expr, Arc<Expr>>,
@@ -263,7 +312,6 @@ fn eval(expr: &Expr, point: &Point, var_map: &BTreeMap<char, usize>) -> Option<f
             let lv = eval(l, point, var_map)?;
             let rv = eval(r, point, var_map)?;
             
-            // Reject extreme exponents to avoid numerical artifacts
             if rv.abs() > 20.0 {
                 return None;
             }
@@ -289,7 +337,7 @@ fn compute_value_vector(
 }
 
 fn normalize_vector(vec: &ValueVector) -> Vec<i64> {
-    const SCALE: f64 = 1e12; // Much higher precision
+    const SCALE: f64 = 1e12;
     vec.iter().map(|&v| (v * SCALE).round() as i64).collect()
 }
 
@@ -354,64 +402,75 @@ fn use_all_variables(e1: &Expr, e2: &Expr, required_vars: &BTreeSet<char>) -> bo
     required_vars.iter().all(|v| all_vars.contains(v))
 }
 
-// Simple algebraic equivalence check using canonical form
-// Expand and normalize both expressions, then compare
 fn are_algebraically_equivalent(e1: &Expr, e2: &Expr, _var_map: &BTreeMap<char, usize>) -> bool {
     let canon1 = to_canonical_form(e1);
     let canon2 = to_canonical_form(e2);
     
-    // Check if both canonicalizations succeeded
     let both_valid = match (&canon1, &canon2) {
         (CanonicalExpr::Sum(v1), CanonicalExpr::Sum(v2)) => {
             !v1.is_empty() && !v2.is_empty()
         }
     };
     
-    // Only compare if both are valid
     if both_valid {
-        let result = canon1 == canon2;
-        // Debug: log when we detect equivalence
-        if result {
-            // These are algebraically equivalent - should be filtered
-        }
-        result
+        canon1 == canon2
     } else {
-        // Can't determine equivalence, assume they're different
-        false
+        match (&canon1, &canon2) {
+            (CanonicalExpr::Sum(v1), CanonicalExpr::Sum(v2)) => {
+                v1.is_empty() && v2.is_empty()
+            }
+        }
     }
 }
 
-// Canonical form: expand to sum of products, sorted
+fn canonical_to_string(canon: &CanonicalExpr) -> String {
+    match canon {
+        CanonicalExpr::Sum(products) => {
+            if products.is_empty() {
+                return "FAILED".to_string();
+            }
+            let terms: Vec<String> = products.iter().map(|p| {
+                let mut s = format!("{}", p.coeff);
+                for factor in &p.terms {
+                    let Factor::Var(c, exp) = factor;
+                    if *exp == 1 {
+                        s.push_str(&format!("*{}", c));
+                    } else {
+                        s.push_str(&format!("*{}^{}", c, exp));
+                    }
+                }
+                s
+            }).collect();
+            terms.join(" + ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CanonicalExpr {
-    Sum(Vec<Product>),  // Sum of products
+    Sum(Vec<Product>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Product {
-    coeff: i64,  // Coefficient
-    terms: Vec<Factor>,  // Sorted list of factors
+    coeff: i64,
+    terms: Vec<Factor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Factor {
-    Var(char, i32),  // Variable with exponent
+    Var(char, i32),
 }
 
 fn to_canonical_form(expr: &Expr) -> CanonicalExpr {
-    // Expand to sum of products
     let expanded = expand_expr(expr);
-    
-    // Normalize: combine like terms, sort
     let products = expanded.0;
     
-    // Combine like terms
     let mut term_map: HashMap<Vec<Factor>, i64> = HashMap::new();
     for product in products {
         *term_map.entry(product.terms).or_insert(0) += product.coeff;
     }
     
-    // Remove zero terms and convert back
     let mut result: Vec<Product> = term_map
         .into_iter()
         .filter(|(_, coeff)| *coeff != 0)
@@ -423,7 +482,6 @@ fn to_canonical_form(expr: &Expr) -> CanonicalExpr {
     CanonicalExpr::Sum(result)
 }
 
-// Represents expression as sum of products during expansion
 #[derive(Debug, Clone)]
 struct ExpandedExpr(Vec<Product>);
 
@@ -475,14 +533,12 @@ fn expand_expr(expr: &Expr) -> ExpandedExpr {
                     let mut terms = lp.terms.clone();
                     terms.extend(rp.terms.clone());
                     
-                    // Combine same variables
                     let mut var_powers: HashMap<char, i32> = HashMap::new();
                     for factor in terms {
                         let Factor::Var(c, exp) = factor;
                         *var_powers.entry(c).or_insert(0) += exp;
                     }
                     
-                    // Convert back to sorted factors
                     let mut new_terms: Vec<Factor> = var_powers
                         .into_iter()
                         .filter(|(_, exp)| *exp != 0)
@@ -500,24 +556,16 @@ fn expand_expr(expr: &Expr) -> ExpandedExpr {
             ExpandedExpr(result)
         }
         Expr::Div(l, r) => {
-            // Expand division as multiplication by reciprocal
-            // l / r becomes l * (1/r) in canonical form
             let left = expand_expr(l);
             let right = expand_expr(r);
             
-            // For division, we negate the exponents in the denominator
             let mut result = Vec::new();
             for lp in &left.0 {
                 for rp in &right.0 {
-                    // Check for division by zero
                     if rp.coeff == 0 {
-                        continue; // Skip this term
+                        continue;
                     }
                     
-                    // For canonical form, we need to handle fractional coefficients
-                    // Since we're using i64, we can only handle cases where division is exact
-                    // OR we need a way to represent fractions
-                    // For now, use GCD to reduce the fraction
                     fn gcd(mut a: i64, mut b: i64) -> i64 {
                         a = a.abs();
                         b = b.abs();
@@ -533,28 +581,24 @@ fn expand_expr(expr: &Expr) -> ExpandedExpr {
                     let num = lp.coeff / g;
                     let den = rp.coeff / g;
                     
-                    // If denominator is not 1, we can't represent this as integer coefficient
-                    // This means the canonical form can't be computed
                     if den != 1 && den != -1 {
                         return ExpandedExpr(vec![]);
                     }
                     
                     let final_coeff = if den == -1 { -num } else { num };
                     
-                    // Add numerator terms
                     let mut var_powers: HashMap<char, i32> = HashMap::new();
+                    
                     for factor in &lp.terms {
                         let Factor::Var(c, exp) = factor;
                         *var_powers.entry(*c).or_insert(0) += exp;
                     }
                     
-                    // Subtract denominator terms (division = multiply by reciprocal)
                     for factor in &rp.terms {
                         let Factor::Var(c, exp) = factor;
                         *var_powers.entry(*c).or_insert(0) -= exp;
                     }
                     
-                    // Convert back to sorted factors
                     let mut new_terms: Vec<Factor> = var_powers
                         .into_iter()
                         .filter(|(_, exp)| *exp != 0)
@@ -572,22 +616,30 @@ fn expand_expr(expr: &Expr) -> ExpandedExpr {
             ExpandedExpr(result)
         }
         Expr::Pow(base, exp) => {
-            // Only handle constant exponents
-            if let Expr::Const(n) = exp.as_ref() {
-                if *n >= 0 && *n <= 10 {
-                    // Expand base^n as base * base * ... * base
+            let exp_value = match exp.as_ref() {
+                Expr::Const(n) => Some(*n),
+                Expr::Neg(inner) => {
+                    if let Expr::Const(n) = inner.as_ref() {
+                        Some(-n)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            
+            if let Some(n) = exp_value {
+                if n >= 0 && n <= 10 {
                     let mut result = ExpandedExpr(vec![Product { coeff: 1, terms: vec![] }]);
                     let base_expanded = expand_expr(base);
                     
-                    for _ in 0..*n {
-                        // Multiply result by base_expanded
+                    for _ in 0..n {
                         let mut new_result = Vec::new();
                         for rp in &result.0 {
                             for bp in &base_expanded.0 {
                                 let mut terms = rp.terms.clone();
                                 terms.extend(bp.terms.clone());
                                 
-                                // Combine same variables
                                 let mut var_powers: HashMap<char, i32> = HashMap::new();
                                 for factor in terms {
                                     let Factor::Var(c, exp) = factor;
@@ -611,14 +663,74 @@ fn expand_expr(expr: &Expr) -> ExpandedExpr {
                     }
                     
                     return result;
+                } else if n < 0 && n >= -10 {
+                    let pos_n = -n;
+                    let mut power_result = ExpandedExpr(vec![Product { coeff: 1, terms: vec![] }]);
+                    let base_expanded = expand_expr(base);
+                    
+                    for _ in 0..pos_n {
+                        let mut new_result = Vec::new();
+                        for rp in &power_result.0 {
+                            for bp in &base_expanded.0 {
+                                let mut terms = rp.terms.clone();
+                                terms.extend(bp.terms.clone());
+                                
+                                let mut var_powers: HashMap<char, i32> = HashMap::new();
+                                for factor in terms {
+                                    let Factor::Var(c, exp) = factor;
+                                    *var_powers.entry(c).or_insert(0) += exp;
+                                }
+                                
+                                let mut new_terms: Vec<Factor> = var_powers
+                                    .into_iter()
+                                    .filter(|(_, exp)| *exp != 0)
+                                    .map(|(c, exp)| Factor::Var(c, exp))
+                                    .collect();
+                                new_terms.sort();
+                                
+                                new_result.push(Product {
+                                    coeff: rp.coeff * bp.coeff,
+                                    terms: new_terms,
+                                });
+                            }
+                        }
+                        power_result = ExpandedExpr(new_result);
+                    }
+                    
+                    let numerator = ExpandedExpr(vec![Product { coeff: 1, terms: vec![] }]);
+                    let mut result = Vec::new();
+                    
+                    for np in &numerator.0 {
+                        for dp in &power_result.0 {
+                            if dp.coeff == 0 {
+                                continue;
+                            }
+                            
+                            let mut var_powers: HashMap<char, i32> = HashMap::new();
+                            for factor in &dp.terms {
+                                let Factor::Var(c, exp) = factor;
+                                *var_powers.entry(*c).or_insert(0) -= exp;
+                            }
+                            
+                            let mut new_terms: Vec<Factor> = var_powers
+                                .into_iter()
+                                .filter(|(_, exp)| *exp != 0)
+                                .map(|(c, exp)| Factor::Var(c, exp))
+                                .collect();
+                            new_terms.sort();
+                            
+                            result.push(Product {
+                                coeff: np.coeff / dp.coeff,
+                                terms: new_terms,
+                            });
+                        }
+                    }
+                    
+                    return ExpandedExpr(result);
                 }
             }
             
-            // Can't expand general powers
-            ExpandedExpr(vec![Product {
-                coeff: 1,
-                terms: vec![],
-            }])
+            ExpandedExpr(vec![])
         }
     }
 }
@@ -627,7 +739,7 @@ fn find_shortest_equivalence(
     points: &[Point],
     var_map: &BTreeMap<char, usize>,
     max_total_size: usize,
-    log_callback: &dyn Fn(String)
+    logger: &Logger
 ) -> Option<(Arc<Expr>, Arc<Expr>)> {
     let mut interner = ExprInterner::new();
     let mut value_to_expr: BTreeMap<Vec<i64>, Arc<Expr>> = BTreeMap::new();
@@ -659,11 +771,9 @@ fn find_shortest_equivalence(
         }
     }
     
-    log_callback(format!("Size 1: {} unique expressions", 
+    logger.info(format!("Size 1: {} unique expressions", 
              exprs_by_size.get(1).map_or(0, |v| v.len())));
     
-    // Search with early termination: stop as soon as we find any equivalence
-    // Since we search in increasing size order, the first one found is guaranteed shortest
     for size in 2..=max_total_size {
         let mut new_exprs = Vec::new();
         
@@ -677,13 +787,10 @@ fn find_shortest_equivalence(
                         if existing.as_ref() != expr.as_ref() 
                             && !are_structurally_equivalent(existing, &expr) {
                             
-                            // Reject if both sides are constants (like 0 = 0)
                             if matches!(existing.as_ref(), Expr::Const(_)) && matches!(expr.as_ref(), Expr::Const(_)) {
                                 continue;
                             }
                             
-                            // Reject if both expressions evaluate to the same constant on all points
-                            // (e.g., 0 = 0/(x+y+z) where both always equal 0)
                             let existing_vals: Vec<_> = points.iter()
                                 .filter_map(|p| eval(existing, p, var_map))
                                 .collect();
@@ -692,23 +799,25 @@ fn find_shortest_equivalence(
                                 .collect();
                             
                             if !existing_vals.is_empty() && !expr_vals.is_empty() {
-                                let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-10);
-                                let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-10);
+                                let existing_constant = existing_vals.iter().all(|&v| (v - existing_vals[0]).abs() < 1e-15);
+                                let expr_constant = expr_vals.iter().all(|&v| (v - expr_vals[0]).abs() < 1e-15);
                                 
                                 if existing_constant && expr_constant {
-                                    // Both are constant - skip this trivial equivalence
+                                    continue;
+                                }
+                                
+                                let has_extreme_existing = existing_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
+                                let has_extreme_expr = expr_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
+                                
+                                if has_extreme_existing || has_extreme_expr {
                                     continue;
                                 }
                             }
                             
-                            // Check total size FIRST before any expensive operations
                             let total_size = existing.size() + expr.size();
                             if total_size > max_total_size {
-                                continue; // Skip pairs that exceed the limit
+                                continue;
                             }
-                            
-                            let existing_str = existing.to_string();
-                            let expr_str = expr.to_string();
                             
                             if !use_all_variables(existing, &expr, &required_vars) {
                                 continue;
@@ -716,14 +825,14 @@ fn find_shortest_equivalence(
                             
                             let are_alg_equiv = are_algebraically_equivalent(existing, &expr, var_map);
                             
-                            log_callback(format!("Comparing: {} vs {} | Alg equiv: {} | Total: {}", 
-                                               existing_str, expr_str, are_alg_equiv, total_size));
+                            logger.debug(format!("Comparing: {} vs {} | Alg equiv: {} | Total: {}", 
+                                               existing.to_string(), expr.to_string(), are_alg_equiv, total_size));
+                            logger.debug(format!("  Canon1: {}", canonical_to_string(&to_canonical_form(existing))));
+                            logger.debug(format!("  Canon2: {}", canonical_to_string(&to_canonical_form(&expr))));
                             
                             if !are_alg_equiv {
-                                log_callback(format!("FOUND SHORTEST equivalence with total size {}", total_size));
+                                logger.info(format!("FOUND equivalence with total size {}", total_size));
                                 return Some((Arc::clone(existing), expr));
-                            } else {
-                                log_callback(format!("REJECTED as algebraically equivalent"));
                             }
                         }
                     } else {
@@ -774,12 +883,10 @@ fn find_shortest_equivalence(
                                     if existing.as_ref() != expr.as_ref()
                                         && !are_structurally_equivalent(existing, &expr) {
                                         
-                                        // Reject if both sides are constants (like 0 = 0)
                                         if matches!(existing.as_ref(), Expr::Const(_)) && matches!(expr.as_ref(), Expr::Const(_)) {
                                             continue;
                                         }
                                         
-                                        // Reject if both expressions evaluate to the same constant on all points
                                         let existing_vals: Vec<_> = points.iter()
                                             .filter_map(|p| eval(existing, p, var_map))
                                             .collect();
@@ -795,23 +902,18 @@ fn find_shortest_equivalence(
                                                 continue;
                                             }
                                             
-                                            // Also reject if either expression has extreme values (numerical artifacts)
                                             let has_extreme_existing = existing_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
                                             let has_extreme_expr = expr_vals.iter().any(|&v| v.abs() < 1e-100 || v.abs() > 1e100);
                                             
                                             if has_extreme_existing || has_extreme_expr {
-                                                continue; // Skip numerical artifacts
+                                                continue;
                                             }
                                         }
                                         
-                                        // Check total size FIRST before any expensive operations
                                         let total_size = existing.size() + expr.size();
                                         if total_size > max_total_size {
-                                            continue; // Skip pairs that exceed the limit
+                                            continue;
                                         }
-                                        
-                                        let existing_str = existing.to_string();
-                                        let expr_str = expr.to_string();
                                         
                                         if !use_all_variables(existing, &expr, &required_vars) {
                                             continue;
@@ -819,14 +921,14 @@ fn find_shortest_equivalence(
                                         
                                         let are_alg_equiv = are_algebraically_equivalent(existing, &expr, var_map);
                                         
-                                        log_callback(format!("Comparing: {} vs {} | Alg equiv: {} | Total: {}", 
-                                                           existing_str, expr_str, are_alg_equiv, total_size));
+                                        logger.debug(format!("Comparing: {} vs {} | Alg equiv: {} | Total: {}", 
+                                                           existing.to_string(), expr.to_string(), are_alg_equiv, total_size));
+                                        logger.debug(format!("  Canon1: {}", canonical_to_string(&to_canonical_form(existing))));
+                                        logger.debug(format!("  Canon2: {}", canonical_to_string(&to_canonical_form(&expr))));
                                         
                                         if !are_alg_equiv {
-                                            log_callback(format!("FOUND SHORTEST equivalence with total size {}", total_size));
+                                            logger.info(format!("FOUND equivalence with total size {}", total_size));
                                             return Some((Arc::clone(existing), expr));
-                                        } else {
-                                            log_callback(format!("REJECTED as algebraically equivalent"));
                                         }
                                     }
                                 } else {
@@ -844,7 +946,7 @@ fn find_shortest_equivalence(
             exprs_by_size.add(expr);
         }
         
-        log_callback(format!("Size {}: {} unique expressions (total: {})", 
+        logger.info(format!("Size {}: {} unique expressions (total: {})", 
                  size, 
                  exprs_by_size.get(size).map_or(0, |v| v.len()),
                  value_to_expr.len()));
@@ -907,10 +1009,10 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
     let log_callback = |msg: String| {
         let _ = log_fn.call1(&JsValue::NULL, &JsValue::from_str(&msg));
     };
+    let logger = Logger::new(&log_callback);
     
-    log_callback(format!("=== SEARCH STARTED with max_total_size={} ===", max_size));
+    logger.info(format!("Search started with max_total_size={}", max_size));
     
-    // Parse points
     let mut points = Vec::new();
     let mut dimension = None;
     
@@ -928,7 +1030,7 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
         if !coords.is_empty() {
             if let Some(dim) = dimension {
                 if coords.len() != dim {
-                    log_callback("Error: Inconsistent dimensions in input".to_string());
+                    logger.error("Inconsistent dimensions in input".to_string());
                     return SearchResult {
                         found: false,
                         f_expr: String::new(),
@@ -949,7 +1051,7 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
     let dim = dimension.unwrap_or(0);
     
     if points.is_empty() {
-        log_callback("Error: No points found in input".to_string());
+        logger.error("No points found in input".to_string());
         return SearchResult {
             found: false,
             f_expr: String::new(),
@@ -961,9 +1063,8 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
         };
     }
     
-    log_callback(format!("Read {} points of dimension {}", points.len(), dim));
+    logger.info(format!("Read {} points of dimension {}", points.len(), dim));
     
-    // Create variable map
     let mut var_map = BTreeMap::new();
     for (i, c) in "xyzwuvabcdefghijklmnopqrst".chars().enumerate() {
         if i < dim {
@@ -971,14 +1072,12 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
         }
     }
     
-    log_callback("Starting search...".to_string());
+    logger.info("Starting progressive search".to_string());
     
-    // Progressive search: start with minimum possible size and increase
-    // This guarantees we find the shortest equivalence
     for target_size in 2..=max_size {
-        log_callback(format!("Searching for equivalences with total size <= {}", target_size));
+        logger.info(format!("Searching for equivalences with total size <= {}", target_size));
         
-        if let Some((f, g)) = find_shortest_equivalence(&points, &var_map, target_size, &log_callback) {
+        if let Some((f, g)) = find_shortest_equivalence(&points, &var_map, target_size, &logger) {
             let var_names: Vec<char> = var_map.keys().copied().collect();
             let var_signature = if var_names.len() == 1 {
                 format!("({})", var_names[0])
@@ -986,14 +1085,13 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
                 format!("({})", var_names.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "))
             };
             
-            // Calculate errors for each point
             let mut errors = Vec::new();
             for (i, point) in points.iter().enumerate() {
                 let f_val = eval(&f, point, &var_map).unwrap_or(f64::NAN);
                 let g_val = eval(&g, point, &var_map).unwrap_or(f64::NAN);
                 let error = (f_val - g_val).abs();
                 errors.push(error);
-                log_callback(format!("Point {}: f={:.6}, g={:.6}, error={:.2e}", i+1, f_val, g_val, error));
+                logger.debug(format!("Point {}: f={:.6}, g={:.6}, error={:.2e}", i+1, f_val, g_val, error));
             }
             
             return SearchResult {
@@ -1008,8 +1106,7 @@ pub fn search_equivalence(points_str: &str, max_size: usize, log_fn: &js_sys::Fu
         }
     }
     
-    // No equivalence found
-    log_callback(format!("No equivalence found up to size {}", max_size));
+    logger.warn(format!("No equivalence found up to size {}", max_size));
     SearchResult {
         found: false,
         f_expr: String::new(),
