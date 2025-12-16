@@ -271,16 +271,21 @@
     </div>
 
     <script type="module">
-        import init, { search_equivalence } from './pkg/points.js';
-
-        let wasmInitialized = false;
         let searchInProgress = false;
+        let worker = null;
 
-        async function initWasm() {
-            if (!wasmInitialized) {
-                await init();
-                wasmInitialized = true;
+        // Initialize worker
+        function initWorker() {
+            if (!worker) {
+                try {
+                    worker = new Worker('./worker.js', { type: 'module' });
+                    console.log('Web Worker initialized');
+                } catch (e) {
+                    console.error('Failed to create Web Worker:', e);
+                    throw new Error('Web Worker not supported or worker.js not found');
+                }
             }
+            return worker;
         }
 
         window.runSearch = async function() {
@@ -307,29 +312,40 @@
             searchBtn.disabled = true;
             loadingSpinner.classList.remove('hidden');
 
-            // Multiple strategies to ensure UI updates
-            await new Promise(resolve => requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    setTimeout(resolve, 0);
-                });
-            }));
-
             try {
-                await initWasm();
-
-                let currentTarget = 0;
-                const logCallback = (msg) => {
-                    // Update status text with current search progress
-                    if (msg.startsWith('Searching for equivalences with total size <=')) {
-                        const match = msg.match(/\d+/);
-                        if (match) {
-                            currentTarget = parseInt(match[0]);
-                            statusText.textContent = `Searching for expressions with total length ≤ ${currentTarget}...`;
+                const w = initWorker();
+                
+                // Set up message handler
+                const resultPromise = new Promise((resolve, reject) => {
+                    w.onmessage = function(e) {
+                        const { type, message, result } = e.data;
+                        
+                        if (type === 'log') {
+                            // Update status text with current search progress
+                            if (message.startsWith('Searching for equivalences with total size <=')) {
+                                const match = message.match(/\d+/);
+                                if (match) {
+                                    const currentTarget = parseInt(match[0]);
+                                    statusText.textContent = `Searching for expressions with total length ≤ ${currentTarget}...`;
+                                }
+                            }
+                        } else if (type === 'result') {
+                            resolve(result);
+                        } else if (type === 'error') {
+                            reject(new Error(message));
                         }
-                    }
-                };
-
-                const result = search_equivalence(pointsText, maxSize, logCallback);
+                    };
+                    
+                    w.onerror = function(error) {
+                        reject(error);
+                    };
+                });
+                
+                // Send search request to worker
+                w.postMessage({ pointsText, maxSize });
+                
+                // Wait for result
+                const result = await resultPromise;
 
                 searchStatus.classList.add('hidden');
 
@@ -366,20 +382,18 @@
                     `;
                 }
             } catch (error) {
+                searchStatus.classList.add('hidden');
                 resultContent.innerHTML = `
                     <div class="result-box error">
                         Error: ${error.message}
                     </div>
                 `;
-                console.error(error);
             } finally {
                 searchBtn.disabled = false;
                 loadingSpinner.classList.add('hidden');
                 searchInProgress = false;
             }
         };
-
-        initWasm();
     </script>
 </body>
 </html>
