@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Points</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <style>
         * {
             margin: 0;
@@ -232,6 +234,26 @@
         .hidden {
             display: none;
         }
+
+        #plotContainer {
+            margin-top: 24px;
+        }
+
+        #plotContainer.hidden {
+            display: none;
+        }
+
+        #plot {
+            width: 100%;
+            height: 450px;
+        }
+
+        .plot-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            margin-bottom: 8px;
+        }
     </style>
 </head>
 <body>
@@ -241,16 +263,17 @@
 
         <div class="section">
             <label for="points">Points (one per line, space-separated)</label>
-            <textarea id="points" rows="6">4 3 1
-1 2 3
-3 5 1</textarea>
+            <textarea id="points" rows="6">1 1
+3 5
+5 11
+3 -5</textarea>
         </div>
 
         <div class="section">
             <div class="controls">
                 <div>
                     <label for="maxSize">Max total length</label>
-                    <input type="number" id="maxSize" value="8" min="2" max="30">
+                    <input type="number" id="maxSize" value="12" min="2" max="30">
                 </div>
                 <div>
                     <button id="searchBtn" onclick="runSearch()">
@@ -267,12 +290,231 @@
                 <div id="statusText">Searching...</div>
             </div>
             <div id="resultContent"></div>
+            <div id="plotContainer" class="hidden">
+                <div class="plot-label">Visualization</div>
+                <div id="plot"></div>
+            </div>
         </div>
     </div>
 
     <script type="module">
         let searchInProgress = false;
         let worker = null;
+
+        // --- Expression parser & evaluator ---
+        // Parses expression strings like "x + 2 * y^3 - (z / 2)"
+        // into a function(vars) => number
+
+        function parseExpr(str) {
+            let pos = 0;
+            const s = str.replace(/\s+/g, '');
+
+            function peek() { return s[pos]; }
+            function consume(ch) {
+                if (s[pos] === ch) { pos++; return true; }
+                return false;
+            }
+
+            // Grammar (precedence low to high):
+            // expr     = term (('+' | '-') term)*
+            // term     = power (('*' | '/') power)*
+            // power    = unary ('^' unary)*
+            // unary    = '-' unary | atom
+            // atom     = '(' expr ')' | number | variable
+
+            function expr() {
+                let left = term();
+                while (pos < s.length) {
+                    if (consume('+')) { const r = term(); const l = left; left = (v) => l(v) + r(v); }
+                    else if (s[pos] === '-') {
+                        pos++; const r = term(); const l = left; left = (v) => l(v) - r(v);
+                    }
+                    else break;
+                }
+                return left;
+            }
+
+            function term() {
+                let left = power();
+                while (pos < s.length) {
+                    if (consume('*')) { const r = power(); const l = left; left = (v) => l(v) * r(v); }
+                    else if (consume('/')) { const r = power(); const l = left; left = (v) => l(v) / r(v); }
+                    else break;
+                }
+                return left;
+            }
+
+            function power() {
+                let base = unary();
+                if (consume('^')) {
+                    const exp = unary();
+                    const b = base;
+                    return (v) => Math.pow(b(v), exp(v));
+                }
+                return base;
+            }
+
+            function unary() {
+                if (consume('-')) {
+                    const inner = unary();
+                    return (v) => -inner(v);
+                }
+                return atom();
+            }
+
+            function atom() {
+                if (consume('(')) {
+                    const inner = expr();
+                    consume(')');
+                    return inner;
+                }
+                // number (single digit constant 0-9)
+                if (s[pos] >= '0' && s[pos] <= '9') {
+                    let numStr = '';
+                    while (pos < s.length && s[pos] >= '0' && s[pos] <= '9') {
+                        numStr += s[pos++];
+                    }
+                    const n = parseFloat(numStr);
+                    return (_v) => n;
+                }
+                // variable (single letter)
+                const varName = s[pos++];
+                return (v) => v[varName] || 0;
+            }
+
+            const fn = expr();
+            return fn;
+        }
+
+        const VAR_NAMES = ['x','y','z','w','u','v','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t'];
+
+        function parsePoints(text) {
+            return text.trim().split('\n').filter(l => l.trim()).map(line =>
+                line.trim().split(/\s+/).map(Number)
+            );
+        }
+
+        function renderPlot(points, fExpr, gExpr) {
+            const plotContainer = document.getElementById('plotContainer');
+            const plotDiv = document.getElementById('plot');
+
+            if (!points.length) { plotContainer.classList.add('hidden'); return; }
+            const dim = points[0].length;
+
+            if (dim !== 2) {
+                plotContainer.classList.add('hidden');
+                return;
+            }
+
+            plotContainer.classList.remove('hidden');
+
+            const fFn = parseExpr(fExpr);
+            const gFn = parseExpr(gExpr);
+            const diffFn = (v) => fFn(v) - gFn(v);
+
+            render2Vars(plotDiv, points, diffFn, fExpr, gExpr);
+        }
+
+        // 2 variables (x, y): heatmap of |f-g| with scatter points
+        function render2Vars(plotDiv, points, diffFn, fLabel, gLabel) {
+            const xs = points.map(p => p[0]);
+            const ys = points.map(p => p[1]);
+            const steps = 300;
+
+            function computeContour(xLo, xHi, yLo, yHi) {
+                const gridX = [], gridY = [];
+                for (let i = 0; i <= steps; i++) {
+                    gridX.push(xLo + (xHi - xLo) * i / steps);
+                    gridY.push(yLo + (yHi - yLo) * i / steps);
+                }
+                const zGrid = gridY.map(yVal =>
+                    gridX.map(xVal => {
+                        const val = diffFn({x: xVal, y: yVal});
+                        return isFinite(val) ? val : 1e6;
+                    })
+                );
+                return { gridX, gridY, zGrid };
+            }
+
+            // Initial view: large padding so the full curve shape is visible
+            const xMin = Math.min(...xs), xMax = Math.max(...xs);
+            const yMin = Math.min(...ys), yMax = Math.max(...ys);
+            const xRange = xMax - xMin || 2, yRange = yMax - yMin || 2;
+            const xPad = xRange * 3;
+            const yPad = yRange * 3;
+            let viewXLo = xMin - xPad, viewXHi = xMax + xPad;
+            let viewYLo = yMin - yPad, viewYHi = yMax + yPad;
+
+            function rerender(xLo, xHi, yLo, yHi) {
+                // Compute grid with 30% overshoot so curve doesn't clip at edges
+                const dx = (xHi - xLo) * 0.3, dy = (yHi - yLo) * 0.3;
+                const c = computeContour(xLo - dx, xHi + dx, yLo - dy, yHi + dy);
+                Plotly.restyle(plotDiv, { x: [c.gridX], y: [c.gridY], z: [c.zGrid] }, [0]);
+            }
+
+            const init = computeContour(viewXLo - xRange, viewXHi + xRange, viewYLo - yRange, viewYHi + yRange);
+
+            const traces = [
+                {
+                    type: 'contour', x: init.gridX, y: init.gridY, z: init.zGrid,
+                    contours: { start: 0, end: 0, coloring: 'none' },
+                    line: { color: '#4a9d5f', width: 3 },
+                    showscale: false,
+                    hoverinfo: 'skip',
+                    name: `${fLabel} = ${gLabel}`
+                },
+                {
+                    x: xs, y: ys, mode: 'markers', type: 'scatter',
+                    name: 'Input points',
+                    marker: { size: 10, color: '#111', symbol: 'circle', line: { color: 'white', width: 2 } }
+                }
+            ];
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 50 },
+                xaxis: { title: 'x', gridcolor: '#e0e0e0', range: [viewXLo, viewXHi] },
+                yaxis: { title: 'y', gridcolor: '#e0e0e0', range: [viewYLo, viewYHi] },
+                plot_bgcolor: '#fafafa',
+                paper_bgcolor: '#fafafa',
+                legend: { x: 0, y: 1, bgcolor: 'rgba(255,255,255,0.8)' },
+                font: { family: '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif', size: 12 },
+                dragmode: 'pan'
+            };
+
+            Plotly.newPlot(plotDiv, traces, layout, {
+                responsive: true,
+                scrollZoom: true,
+                modeBarButtonsToAdd: ['resetScale2d']
+            });
+
+            // Recompute contour when the user zooms or pans
+            let debounceTimer = null;
+            plotDiv.on('plotly_relayout', function(evt) {
+                let xLo, xHi, yLo, yHi;
+
+                if (evt['xaxis.range[0]'] != null) {
+                    xLo = evt['xaxis.range[0]'];
+                    xHi = evt['xaxis.range[1]'];
+                    yLo = evt['yaxis.range[0]'];
+                    yHi = evt['yaxis.range[1]'];
+                } else if (evt['xaxis.autorange'] || evt['autosize']) {
+                    // Reset axes to initial view and recompute contour
+                    Plotly.relayout(plotDiv, {
+                        'xaxis.range': [viewXLo, viewXHi],
+                        'yaxis.range': [viewYLo, viewYHi],
+                        'xaxis.autorange': false,
+                        'yaxis.autorange': false
+                    });
+                    rerender(viewXLo, viewXHi, viewYLo, viewYHi);
+                    return;
+                } else {
+                    return;
+                }
+
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => rerender(xLo, xHi, yLo, yHi), 100);
+            });
+        }
 
         // Initialize worker
         function initWorker() {
@@ -320,10 +562,8 @@
                         const { type, message, result } = e.data;
                         
                         if (type === 'log') {
-                            console.log('[WASM]', message); // Log to console
-                            
                             // Update status text with current search progress
-                            if (message.startsWith('Searching for equivalences with total size <=')) {
+                            if (message.includes('Searching for equivalences with total size <=')) {
                                 const match = message.match(/\d+/);
                                 if (match) {
                                     const currentTarget = parseInt(match[0]);
@@ -375,15 +615,26 @@
                             ${errorHtml}
                         </div>
                     `;
+
+                    // Render visualization
+                    try {
+                        const pts = parsePoints(pointsText);
+                        renderPlot(pts, result.f_expr, result.g_expr);
+                    } catch (e) {
+                        console.warn('Plot rendering failed:', e);
+                        document.getElementById('plotContainer').classList.add('hidden');
+                    }
                 } else {
                     resultContent.innerHTML = `
                         <div class="result-box error">
                             No equivalence found up to size ${maxSize}
                         </div>
                     `;
+                    document.getElementById('plotContainer').classList.add('hidden');
                 }
             } catch (error) {
                 searchStatus.classList.add('hidden');
+                document.getElementById('plotContainer').classList.add('hidden');
                 resultContent.innerHTML = `
                     <div class="result-box error">
                         Error: ${error.message}
