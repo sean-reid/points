@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Points</title>
+    <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Points</h1>
+        <p class="subtitle">Finds the lowest-degree algebraic curve with fewest terms and smallest integer coefficients passing through your points</p>
+
+        <div class="grid-section">
+            <canvas id="gridCanvas" width="500" height="500"></canvas>
+            <div class="grid-footer">
+                <span id="pointCount">Click grid to place points</span>
+                <button id="clearBtn" class="clear-btn hidden">Clear</button>
+            </div>
+        </div>
+
+        <div id="resultsSection" class="results hidden">
+            <div id="resultContent"></div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
