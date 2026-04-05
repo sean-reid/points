@@ -23,15 +23,10 @@ jobs:
       - run: cargo test --release
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - run: wasm-pack build --target web
-      - name: Prepare site
-        run: |
-          mkdir -p _site/web _site/pkg
-          cp web/*.html web/*.css web/*.js _site/web/
-          cp pkg/points_bg.wasm pkg/points.js _site/pkg/
-          cp favicon.svg _site/
-          echo '<meta http-equiv="refresh" content="0;url=web/">' > _site/index.html
+      - run: wasm-pack build --target web --out-dir web/pkg
       - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
 
   deploy:
     needs: build

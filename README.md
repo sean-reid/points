@@ -50,9 +50,9 @@ Total Rust: ~520 lines. No external dependencies beyond wasm-bindgen.
 ## Development
 
 ```bash
-cargo test --release           # Run tests (10 tests, <1s)
-wasm-pack build --target web   # Build WASM (~1s)
-python3 -m http.server 8080    # Serve, open http://localhost:8080/web/
+cargo test --release                          # Run tests (10 tests, <1s)
+wasm-pack build --target web --out-dir web/pkg  # Build WASM into web/
+cd web && python3 -m http.server 8080         # Open http://localhost:8080
 ```
 
 ## Deployment

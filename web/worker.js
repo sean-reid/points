@@ -1,4 +1,4 @@
-import init, { solve } from '../pkg/points.js';
+import init, { solve } from './pkg/points.js';
 
 let ready = false;
 
