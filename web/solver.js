@@ -30,9 +30,9 @@ export class Solver {
             this.onResult(null);
             return;
         }
-        // Parse: "equation\tcoeffs\tmonos"
+        // Parse: "equation\tcoeffs\tmonos\tscale"
         const parts = raw.split('\t');
-        if (parts.length !== 3) { this.onResult(null); return; }
+        if (parts.length !== 4) { this.onResult(null); return; }
 
         const equation = parts[0];
         const coefficients = parts[1].split(',').map(Number);
@@ -40,8 +40,9 @@ export class Solver {
             const [i, j] = s.split(':').map(Number);
             return [i, j];
         });
+        const scale = Number(parts[3]);
 
-        this.onResult({ equation, coefficients, monomials });
+        this.onResult({ equation, coefficients, monomials, scale });
     }
 
     solve(points) {

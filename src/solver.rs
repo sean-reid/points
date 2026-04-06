@@ -20,6 +20,8 @@ pub struct CurveResult {
     pub degree: u8,
     /// Formatted equation string.
     pub equation: String,
+    /// Scale factor applied to coordinates (e.g. 4 means coords were multiplied by 4).
+    pub scale: f64,
 }
 
 /// Find the simplest implicit algebraic curve passing through the given points.
@@ -27,9 +29,11 @@ pub struct CurveResult {
 pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
     if points.is_empty() { return None; }
 
-    // Snap to integers and deduplicate
+    // Find the finest grid the points lie on and scale to integers.
+    // E.g. if points are on a 0.25 grid, scale = 4 so 2.25 → 9.
+    let scale = find_scale(points);
     let pts = dedup_points(&points.iter()
-        .map(|&(x, y)| (x.round(), y.round()))
+        .map(|&(x, y)| ((x * scale).round(), (y * scale).round()))
         .collect::<Vec<_>>());
     if pts.is_empty() { return None; }
 
@@ -40,9 +44,9 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
         let yi = y.round() as i64;
         // Prefer x = xi or y = yi, whichever is simpler
         if xi.abs() <= yi.abs() {
-            return Some(make_result(vec![-xi, 1, 0], &all_monomials(1), 1));
+            return Some(make_result(vec![-xi, 1, 0], &all_monomials(1), 1, scale));
         } else {
-            return Some(make_result(vec![-yi, 0, 1], &all_monomials(1), 1));
+            return Some(make_result(vec![-yi, 0, 1], &all_monomials(1), 1, scale));
         }
     }
 
@@ -90,12 +94,30 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
 
             if let Some((coeffs, subset)) = best {
                 let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
-                return Some(make_result(coeffs, &sub_monos, d));
+                return Some(make_result(coeffs, &sub_monos, d, scale));
             }
         }
     }
 
     None
+}
+
+// --- Grid scale detection ---
+
+/// Find the smallest integer scale factor such that all coordinates become integers.
+/// Tries scale = 1, 2, 4, 5, 10, 20, 100 (common grid denominators).
+fn find_scale(points: &[(f64, f64)]) -> f64 {
+    let candidates = [1.0, 2.0, 4.0, 5.0, 10.0, 20.0, 100.0];
+    for &s in &candidates {
+        let all_int = points.iter().all(|&(x, y)| {
+            let sx = x * s;
+            let sy = y * s;
+            (sx - sx.round()).abs() < 1e-6 && (sy - sy.round()).abs() < 1e-6
+        });
+        if all_int { return s; }
+    }
+    // Fallback: round to integers
+    1.0
 }
 
 // --- Monomial generation ---
@@ -200,7 +222,7 @@ fn rationalize(v: &[f64]) -> Option<Vec<i64>> {
     let mut denominators = Vec::new();
     for &x in v {
         if x.abs() < 1e-10 { continue; }
-        let (_, d) = best_rational(x, 1000);
+        let (_, d) = best_rational(x, 10000);
         denominators.push(d);
     }
 
@@ -225,7 +247,7 @@ fn rationalize(v: &[f64]) -> Option<Vec<i64>> {
     let result: Vec<i64> = scaled.iter().map(|&x| x / g).collect();
 
     // Check coefficients are reasonable
-    if result.iter().any(|&x| x.abs() > 10000) { return None; }
+    if result.iter().any(|&x| x.abs() > 100000) { return None; }
 
     Some(result)
 }
@@ -268,9 +290,9 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
 // --- Exact integer verification ---
 
 /// Verify that the curve passes through all points using exact integer arithmetic.
+/// Points should already be scaled to integers.
 fn verify_exact(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64]) -> bool {
     for &(px, py) in points {
-        // Convert to integers (multiply by 2 if half-integers, but for now round)
         let x = px.round() as i64;
         let y = py.round() as i64;
 
@@ -317,7 +339,7 @@ fn score_curve(coeffs: &[i64], monos: &[Mono]) -> u64 {
 
 // --- Equation formatting ---
 
-fn make_result(coeffs: Vec<i64>, monos: &[Mono], degree: u8) -> CurveResult {
+fn make_result(coeffs: Vec<i64>, monos: &[Mono], degree: u8, scale: f64) -> CurveResult {
     let equation = format_equation(&coeffs, monos);
     let (nz_coeffs, nz_monos): (Vec<i64>, Vec<Mono>) = coeffs.iter().zip(monos)
         .filter(|(&c, _)| c != 0)
@@ -329,6 +351,7 @@ fn make_result(coeffs: Vec<i64>, monos: &[Mono], degree: u8) -> CurveResult {
         monomials: nz_monos,
         degree,
         equation,
+        scale,
     }
 }
 
@@ -487,5 +510,27 @@ mod tests {
     fn test_vertical_line() {
         let result = solve(&[(5.0, 0.0), (5.0, 3.0), (5.0, -2.0)], 4).unwrap();
         println!("x=5: {}", result.equation);
+    }
+
+    #[test]
+    fn test_half_integer_line() {
+        let result = solve(&[(0.5, 0.5), (2.5, 2.5)], 4).unwrap();
+        println!("half y=x: {} (scale={})", result.equation, result.scale);
+        assert_eq!(result.scale, 2.0);
+        assert_eq!(result.degree, 1);
+    }
+
+    #[test]
+    fn test_half_integer_circle() {
+        let result = solve(&[(1.5, 2.0), (2.0, 1.5), (2.5, 0.0), (0.0, 2.5)], 4).unwrap();
+        println!("half circle: {} (scale={})", result.equation, result.scale);
+        assert_eq!(result.scale, 2.0);
+    }
+
+    #[test]
+    fn test_half_integer_5_points() {
+        // 5 points on y=x^2 at half-integer x values
+        let result = solve(&[(0.5, 0.25), (1.0, 1.0), (1.5, 2.25), (2.0, 4.0), (-1.5, 2.25)], 4).unwrap();
+        println!("half parabola: {} (scale={})", result.equation, result.scale);
     }
 }

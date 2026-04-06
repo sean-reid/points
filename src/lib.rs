@@ -17,12 +17,12 @@ pub fn solve(points_str: &str) -> JsValue {
 
     match solver::solve(&points, 4) {
         Some(result) => {
-            // Return as tab-separated: equation \t coeff1,coeff2,... \t i1:j1,i2:j2,...
+            // Return as tab-separated: equation \t coeff1,coeff2,... \t i1:j1,i2:j2,... \t scale
             let coeffs_str: String = result.coefficients.iter()
                 .map(|c| c.to_string()).collect::<Vec<_>>().join(",");
             let monos_str: String = result.monomials.iter()
                 .map(|(i, j)| format!("{}:{}", i, j)).collect::<Vec<_>>().join(",");
-            JsValue::from_str(&format!("{}\t{}\t{}", result.equation, coeffs_str, monos_str))
+            JsValue::from_str(&format!("{}\t{}\t{}\t{}", result.equation, coeffs_str, monos_str, result.scale))
         }
         None => JsValue::NULL,
     }

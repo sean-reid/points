@@ -3,7 +3,8 @@
 const GRID_MIN = -10;
 const GRID_MAX = 10;
 const GRID_RANGE = GRID_MAX - GRID_MIN;
-const SNAP = 0.5; // Snap to half-integers for cleaner placement
+const SNAP = 1; // Snap to integers
+const SNAP_RADIUS = 0.4; // Tolerance for toggling off an existing point
 const POINT_RADIUS = 0.5; // Visual radius of each point "circle"
 
 export class Grid {
@@ -39,19 +40,17 @@ export class Grid {
         const px = e.clientX - rect.left;
         const py = e.clientY - rect.top;
 
-        // Convert pixel to grid coordinates (no strict integer snap)
+        // Convert pixel to grid coordinates, snap to nearest quarter-integer
         let gx = GRID_MIN + (px / this.cssWidth) * GRID_RANGE;
         let gy = GRID_MAX - (py / this.cssHeight) * GRID_RANGE;
-
-        // Snap to nearest half-integer for cleaner placement
         gx = Math.round(gx / SNAP) * SNAP;
         gy = Math.round(gy / SNAP) * SNAP;
 
         if (gx < GRID_MIN || gx > GRID_MAX || gy < GRID_MIN || gy > GRID_MAX) return;
 
-        // Toggle: remove if clicking near existing point (1 grid unit tolerance)
+        // Toggle: remove if clicking near existing point
         const removeIdx = this.points.findIndex(p =>
-            Math.abs(p.x - gx) < 0.75 && Math.abs(p.y - gy) < 0.75
+            Math.abs(p.x - gx) < SNAP_RADIUS && Math.abs(p.y - gy) < SNAP_RADIUS
         );
         if (removeIdx >= 0) {
             this.points.splice(removeIdx, 1);

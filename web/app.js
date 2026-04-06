@@ -23,13 +23,15 @@ const solver = new Solver({
         `;
 
         // Build implicit curve function h(x,y) for zero-contour rendering
-        const { coefficients, monomials } = result;
+        // Solver works in scaled coords, so evaluate at (x*scale, y*scale)
+        const { coefficients, monomials, scale } = result;
         grid.setCurve(({x, y}) => {
+            const sx = x * scale, sy = y * scale;
             let sum = 0;
             for (let k = 0; k < coefficients.length; k++) {
                 sum += coefficients[k]
-                    * Math.pow(x, monomials[k][0])
-                    * Math.pow(y, monomials[k][1]);
+                    * Math.pow(sx, monomials[k][0])
+                    * Math.pow(sy, monomials[k][1]);
             }
             return sum;
         });
