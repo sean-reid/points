@@ -1,4 +1,4 @@
-import { Grid } from './grid.js';
+import { Grid, POINT_RADIUS } from './grid.js';
 import { Solver } from './solver.js';
 
 const pointCountEl = document.getElementById('pointCount');
@@ -49,7 +49,7 @@ function onPointsChanged(points) {
         pointCountEl.textContent = `${n} point${n === 1 ? '' : 's'}`;
         clearBtn.classList.remove('hidden');
     }
-    solver.solve(points);
+    solver.solve(points, POINT_RADIUS);
 }
 
 const grid = new Grid(document.getElementById('gridCanvas'), onPointsChanged);

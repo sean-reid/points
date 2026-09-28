@@ -3,7 +3,7 @@ pub mod solver;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-pub fn solve(points_str: &str) -> JsValue {
+pub fn solve(points_str: &str, tolerance: f64) -> JsValue {
     let mut points = Vec::new();
     for line in points_str.lines() {
         let line = line.trim();
@@ -15,7 +15,7 @@ pub fn solve(points_str: &str) -> JsValue {
         }
     }
 
-    match solver::solve(&points, 4) {
+    match solver::solve(&points, 4, tolerance) {
         Some(result) => {
             // Return as tab-separated: equation \t coeff1,coeff2,... \t i1:j1,i2:j2,... \t scale
             let coeffs_str: String = result.coefficients.iter()

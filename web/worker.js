@@ -9,7 +9,7 @@ self.onmessage = async function(e) {
         self.postMessage({ type: 'ready' });
     } else if (e.data.type === 'query') {
         if (!ready) return;
-        const result = solve(e.data.pointsText);
+        const result = solve(e.data.pointsText, e.data.tolerance);
         self.postMessage({ type: 'result', result });
     }
 };

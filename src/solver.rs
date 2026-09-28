@@ -30,9 +30,23 @@ pub struct CurveResult {
     pub scale: f64,
 }
 
-/// Find the simplest implicit algebraic curve passing through the given points.
+/// A curve through the points: the exact search's answer and whether it is a product of
+/// lower-degree curves.
+struct Exact {
+    coefficients: Vec<i64>,
+    monomials: Vec<Mono>,
+    degree: u8,
+    reducible: bool,
+}
+
+/// Find the simplest implicit algebraic curve through the points.
+/// The exact curve of lowest degree through the points is found first. When it is unwieldy,
+/// more than [`APPROX_MAX_TERMS`] terms or a coefficient of four or more digits, a curve of
+/// few small integer terms passing within `tolerance` of every point replaces it if it
+/// scores lower, so hand-placed points on a circle get the circle rather than the exact
+/// curve through their grid positions.
 /// Returns None if no curve of degree ≤ max_degree fits.
-pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
+pub fn solve(points: &[(f64, f64)], max_degree: u8, tolerance: f64) -> Option<CurveResult> {
     if points.is_empty() { return None; }
 
     // Find the finest grid the points lie on and scale to integers.
@@ -54,14 +68,40 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
         }
     }
 
-    // Sparsest reducible curve, keyed by (degree, terms, score). Returned only when no
-    // irreducible curve exists within max_degree.
+    let exact = solve_exact(&pts, max_degree);
+    // A presentable exact curve stands. Half a unit is wide next to points a few units
+    // apart, and the five points of y^2 = x^3 + 1 lie within it of a hyperbola.
+    let max_score = match &exact {
+        Some(e) if !e.reducible && e.is_presentable() => {
+            return exact.map(|e| make_result(e.coefficients, &e.monomials, e.degree, scale));
+        }
+        Some(e) if !e.reducible => score_curve(&e.coefficients, &e.monomials),
+        _ => u128::MAX,
+    };
+    if let Some((coeffs, monos, degree)) = solve_within(&pts, tolerance * scale, max_score) {
+        return Some(make_result(coeffs, &monos, degree, scale));
+    }
+    exact.map(|e| make_result(e.coefficients, &e.monomials, e.degree, scale))
+}
+
+impl Exact {
+    /// At most [`APPROX_MAX_TERMS`] terms, every coefficient under four digits.
+    fn is_presentable(&self) -> bool {
+        self.coefficients.iter().filter(|&&c| c != 0).count() <= APPROX_MAX_TERMS
+            && self.coefficients.iter().all(|c| c.abs() < 1000)
+    }
+}
+
+/// The sparsest irreducible curve of lowest degree through every point, or the sparsest
+/// reducible one when nothing irreducible exists within max_degree.
+fn solve_exact(pts: &[IPoint], max_degree: u8) -> Option<Exact> {
+    // Sparsest reducible curve, keyed by (degree, terms, score).
     let mut fallback: Option<((u8, usize, u128), Vec<i64>, Vec<Mono>)> = None;
 
     for d in 1..=max_degree {
         let monos = all_monomials(d);
         let n_mono = monos.len();
-        let search = DegreeSearch::new(&pts, &monos);
+        let search = DegreeSearch::new(pts, &monos);
         if search.null_exact.is_empty() { continue; }
         let supported = search.supported_subsets();
 
@@ -72,7 +112,7 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
             for (subset, patterns, modular_dim) in &supported[k] {
                 let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
                 for int_vec in search.exact_candidates(subset, patterns, *modular_dim) {
-                    if !verify_exact(&pts, &sub_monos, &int_vec) { continue; }
+                    if !verify_exact(pts, &sub_monos, &int_vec) { continue; }
                     // Skip if all non-constant coefficients are zero
                     let has_vars = sub_monos.iter().zip(&int_vec)
                         .any(|(&m, &c)| c != 0 && m != (0, 0));
@@ -83,19 +123,19 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
             scored.sort_by_key(|(score, _, _)| *score);
 
             for (score, coeffs, sub_monos) in scored {
-                if is_reducible(&pts, &sub_monos, &coeffs) {
+                if is_reducible(pts, &sub_monos, &coeffs) {
                     let key = (d, k, score);
                     if fallback.as_ref().map_or(true, |(fk, _, _)| key < *fk) {
                         fallback = Some((key, coeffs, sub_monos));
                     }
                     continue;
                 }
-                return Some(make_result(coeffs, &sub_monos, d, scale));
+                return Some(Exact { coefficients: coeffs, monomials: sub_monos, degree: d, reducible: false });
             }
         }
     }
 
-    fallback.map(|((d, _, _), coeffs, monos)| make_result(coeffs, &monos, d, scale))
+    fallback.map(|((d, _, _), coefficients, monomials)| Exact { coefficients, monomials, degree: d, reducible: true })
 }
 
 // --- Grid scale detection ---
@@ -469,6 +509,221 @@ fn verify_exact(points: &[IPoint], monos: &[Mono], coeffs: &[i64]) -> bool {
     })
 }
 
+// --- Approximate fit ---
+
+/// Most terms in an approximate curve.
+const APPROX_MAX_TERMS: usize = 5;
+/// Highest degree searched for an approximate curve.
+const APPROX_MAX_DEGREE: u8 = 3;
+/// Largest multiplier applied to the least-squares direction before rounding, which bounds
+/// the non-constant coefficients of an approximate curve.
+const APPROX_MAX_MULTIPLIER: usize = 60;
+
+/// The lowest-scoring irreducible curve of at most [`APPROX_MAX_TERMS`] small integer
+/// terms that passes within `radius` of every point and scores below `max_score`.
+/// For each monomial support the least-squares direction is rounded at increasing
+/// multipliers; the first rounding within tolerance is the smallest curve on that support.
+fn solve_within(pts: &[IPoint], radius: f64, max_score: u128) -> Option<(Vec<i64>, Vec<Mono>, u8)> {
+    if radius <= 0.0 { return None; }
+    let monos = all_monomials(APPROX_MAX_DEGREE);
+    let n_mono = monos.len();
+    let values: Vec<Vec<f64>> = pts.iter().map(|&(x, y)| {
+        monos.iter().map(|&(i, j)| (x as f64).powi(i as i32) * (y as f64).powi(j as i32)).collect()
+    }).collect();
+    // Partial derivatives of each monomial at each point, for first-order distance checks.
+    let (dx, dy): (Vec<Vec<f64>>, Vec<Vec<f64>>) = pts.iter().map(|&(x, y)| {
+        let (x, y) = (x as f64, y as f64);
+        monos.iter().map(|&(i, j)| (
+            if i == 0 { 0.0 } else { i as f64 * x.powi(i as i32 - 1) * y.powi(j as i32) },
+            if j == 0 { 0.0 } else { j as f64 * x.powi(i as i32) * y.powi(j as i32 - 1) },
+        )).unzip()
+    }).unzip();
+    // Whether every point lies within `r` of the curve to first order.
+    let near = |support: &[usize], c: &[f64], r: f64| {
+        pts.iter().enumerate().all(|(pi, _)| {
+            let (mut h, mut gx, mut gy) = (0.0, 0.0, 0.0);
+            for (a, &j) in support.iter().enumerate() {
+                h += c[a] * values[pi][j];
+                gx += c[a] * dx[pi][j];
+                gy += c[a] * dy[pi][j];
+            }
+            h * h <= r * r * (gx * gx + gy * gy)
+        })
+    };
+    // Columns scaled to unit RMS so the Gram matrix is well conditioned.
+    let col_scale: Vec<f64> = (0..n_mono).map(|c| {
+        let rms = (values.iter().map(|r| r[c] * r[c]).sum::<f64>() / pts.len() as f64).sqrt();
+        if rms > 0.0 { 1.0 / rms } else { 1.0 }
+    }).collect();
+    let gram: Vec<Vec<f64>> = (0..n_mono).map(|a| (0..n_mono).map(|b| {
+        values.iter().map(|r| r[a] * r[b]).sum::<f64>() * col_scale[a] * col_scale[b]
+    }).collect()).collect();
+
+    let mut best: Option<(Vec<i64>, Vec<Mono>)> = None;
+    let mut best_score = max_score;
+    let mut supports: Vec<u32> = (1..1u32 << n_mono).filter(|m| (m.count_ones() as usize) <= APPROX_MAX_TERMS).collect();
+    supports.sort_by_key(|m| m.count_ones());
+
+    const K: usize = APPROX_MAX_TERMS;
+    for mask in supports {
+        let k = mask.count_ones() as usize;
+        // Sorted by size, and a k-term curve scores at least 1000k + k + 1.
+        if (1001 * k + 1) as u128 >= best_score { break; }
+        let mut support = [0usize; K];
+        let mut sub_monos = [(0u8, 0u8); K];
+        for (slot, c) in (0..n_mono).filter(|c| mask >> c & 1 == 1).enumerate() {
+            support[slot] = c;
+            sub_monos[slot] = monos[c];
+        }
+        let (support, sub_monos) = (&support[..k], &sub_monos[..k]);
+        if sub_monos.iter().all(|&m| m == (0, 0)) { continue; }
+
+        let mut sub = [[0.0; K]; K];
+        for a in 0..k {
+            for b in 0..k { sub[a][b] = gram[support[a]][support[b]]; }
+        }
+        let mut v = smallest_eigenvector(sub, k);
+        for a in 0..k { v[a] *= col_scale[support[a]]; }
+        let v = &mut v[..k];
+        let max_var = v.iter().zip(sub_monos)
+            .filter(|(_, &m)| m != (0, 0))
+            .map(|(x, _)| x.abs())
+            .fold(0.0, f64::max);
+        if max_var <= 0.0 { continue; }
+        for x in v.iter_mut() { *x /= max_var; }
+        // Roundings cannot land inside a tolerance the direction itself misses by half.
+        if !near(support, v, 1.5 * radius) { continue; }
+
+        let mut last = [i64::MIN; K];
+        let mut reducible_hits = 0;
+        for t in 1..=APPROX_MAX_MULTIPLIER {
+            let mut c = [0i64; K];
+            for a in 0..k { c[a] = (v[a] * t as f64).round() as i64; }
+            let g = c[..k].iter().fold(0i64, |acc, &x| gcd(acc, x));
+            if g == 0 { continue; }
+            if g > 1 { for x in c[..k].iter_mut() { *x /= g; } }
+            if c[..k] == last[..k] { continue; }
+            last = c;
+
+            let score = score_curve(&c[..k], sub_monos);
+            if score >= best_score { continue; }
+            let mut cf = [0.0; K];
+            for a in 0..k { cf[a] = c[a] as f64; }
+            if !near(support, &cf[..k], 1.5 * radius) { continue; }
+            if !within_tolerance(pts, sub_monos, &cf[..k], radius) { continue; }
+            if is_reducible_small(sub_monos, &c[..k]) {
+                // Points on a product of lines make every rounding of this direction one.
+                reducible_hits += 1;
+                if reducible_hits == 3 { break; }
+                continue;
+            }
+            best_score = score;
+            best = Some((c[..k].to_vec(), sub_monos.to_vec()));
+            break;
+        }
+    }
+
+    best.map(|(c, m)| {
+        let degree = curve_degree(&m, &c);
+        (c, m, degree)
+    })
+}
+
+/// Whether the curve passes within `radius` of every point, by Newton projection of each
+/// point onto the curve. A point whose first step is over twice the radius is rejected
+/// without iterating.
+fn within_tolerance(pts: &[IPoint], monos: &[Mono], coeffs: &[f64], radius: f64) -> bool {
+    pts.iter().all(|&(x0, y0)| {
+        let (px, py) = (x0 as f64, y0 as f64);
+        let (mut x, mut y) = (px, py);
+        let (mut h, mut g) = (0.0, 0.0);
+        for iter in 0..8 {
+            let (hv, gx, gy) = eval_with_gradient(monos, coeffs, x, y);
+            let g2 = gx * gx + gy * gy;
+            if g2 < 1e-18 { return hv.abs() < 1e-9; }
+            h = hv;
+            g = g2.sqrt();
+            let step = h.abs() / g;
+            if iter == 0 && step > 2.0 * radius { return false; }
+            if step <= 1e-9 * radius { break; }
+            x -= h * gx / g2;
+            y -= h * gy / g2;
+        }
+        let dist = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+        h.abs() <= 1e-6 * g * radius && dist <= radius
+    })
+}
+
+fn eval_with_gradient(monos: &[Mono], coeffs: &[f64], x: f64, y: f64) -> (f64, f64, f64) {
+    let mut xp = [1.0; 5];
+    let mut yp = [1.0; 5];
+    for k in 1..5 {
+        xp[k] = xp[k - 1] * x;
+        yp[k] = yp[k - 1] * y;
+    }
+    let (mut h, mut gx, mut gy) = (0.0, 0.0, 0.0);
+    for (&(i, j), &c) in monos.iter().zip(coeffs) {
+        if c == 0.0 { continue; }
+        let (i, j) = (i as usize, j as usize);
+        h += c * xp[i] * yp[j];
+        if i > 0 { gx += c * i as f64 * xp[i - 1] * yp[j]; }
+        if j > 0 { gy += c * j as f64 * xp[i] * yp[j - 1]; }
+    }
+    (h, gx, gy)
+}
+
+/// Eigenvector of the smallest eigenvalue of the leading n × n block of a symmetric
+/// positive semidefinite matrix, by inverse iteration on the matrix shifted just off
+/// singular.
+fn smallest_eigenvector(mut a: [[f64; APPROX_MAX_TERMS]; APPROX_MAX_TERMS], n: usize) -> [f64; APPROX_MAX_TERMS] {
+    let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+    for i in 0..n { a[i][i] += trace * 1e-12 + f64::MIN_POSITIVE; }
+    let mut v = [0.0; APPROX_MAX_TERMS];
+    for i in 0..n { v[i] = 1.0 + 0.1 * i as f64; }
+    for _ in 0..8 {
+        let Some(mut w) = solve_linear(&a, &v, n) else { break };
+        let norm = w[..n].iter().map(|x| x * x).sum::<f64>().sqrt();
+        if !(norm > 0.0 && norm.is_finite()) { break; }
+        for x in w[..n].iter_mut() { *x /= norm; }
+        let change: f64 = (0..n).map(|i| (v[i] - w[i]).abs().min((v[i] + w[i]).abs())).sum();
+        v = w;
+        if change < 1e-9 { break; }
+    }
+    v
+}
+
+/// Solve a x = b on the leading n × n block by Gaussian elimination with partial pivoting.
+fn solve_linear(a: &[[f64; APPROX_MAX_TERMS]; APPROX_MAX_TERMS], b: &[f64; APPROX_MAX_TERMS], n: usize) -> Option<[f64; APPROX_MAX_TERMS]> {
+    let mut m = [[0.0; APPROX_MAX_TERMS + 1]; APPROX_MAX_TERMS];
+    for r in 0..n {
+        m[r][..n].copy_from_slice(&a[r][..n]);
+        m[r][n] = b[r];
+    }
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&i, &j| m[i][col].abs().total_cmp(&m[j][col].abs()))?;
+        if m[pivot][col] == 0.0 { return None; }
+        m.swap(col, pivot);
+        for r in col + 1..n {
+            let f = m[r][col] / m[col][col];
+            if f == 0.0 { continue; }
+            for c in col..=n { m[r][c] -= f * m[col][c]; }
+        }
+    }
+    let mut x = [0.0; APPROX_MAX_TERMS];
+    for r in (0..n).rev() {
+        let s: f64 = (r + 1..n).map(|c| m[r][c] * x[c]).sum();
+        x[r] = (m[r][n] - s) / m[r][r];
+    }
+    Some(x)
+}
+
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 { let t = b; b = a % b; a = t; }
+    a
+}
+
 // --- Irreducibility over the rationals ---
 
 /// Whether the curve is a product of lower-degree curves over the rationals.
@@ -477,15 +732,111 @@ fn verify_exact(points: &[IPoint], monos: &[Mono], coeffs: &[i64]) -> bool {
 /// the cofactor alone fitting at a lower degree. A quartic that is a product of two conics
 /// with no line factor is not detected.
 fn is_reducible(points: &[IPoint], monos: &[Mono], coeffs: &[i64]) -> bool {
-    let degree = monos.iter().zip(coeffs)
-        .filter(|(_, &c)| c != 0)
-        .map(|(&(i, j), _)| i + j)
-        .max().unwrap_or(0);
+    let degree = curve_degree(monos, coeffs);
     match degree {
         0 | 1 => false,
         2 => conic_is_degenerate(monos, coeffs),
-        _ => points.iter().any(|&p| has_line_factor_through(p, monos, coeffs, degree)),
+        _ => {
+            let big: Vec<BigInt> = coeffs.iter().map(|&c| BigInt::from(c)).collect();
+            points.iter().any(|&p| has_line_factor_through(p, monos, &big, degree))
+        }
     }
+}
+
+/// Whether a curve with small coefficients, not necessarily through any of the points, is
+/// a product of lower-degree curves over the rationals. For a cubic that means a line
+/// factor, whose direction is a rational root of the top-degree form and whose offset is a
+/// rational root of the curve restricted to an axis; both come from divisors of the
+/// coefficients, which is only feasible because they are small.
+fn is_reducible_small(monos: &[Mono], coeffs: &[i64]) -> bool {
+    let degree = curve_degree(monos, coeffs);
+    match degree {
+        0 | 1 => false,
+        2 => conic_is_degenerate(monos, coeffs),
+        _ => has_line_factor_small(monos, coeffs, degree),
+    }
+}
+
+fn curve_degree(monos: &[Mono], coeffs: &[i64]) -> u8 {
+    monos.iter().zip(coeffs)
+        .filter(|(_, &c)| c != 0)
+        .map(|(&(i, j), _)| i + j)
+        .max().unwrap_or(0)
+}
+
+fn has_line_factor_small(monos: &[Mono], coeffs: &[i64], degree: u8) -> bool {
+    let c = |i: u8, j: u8| coeff_of(monos, coeffs, (i, j));
+    let on_x_axis: Vec<BigInt> = (0..=degree).map(|i| c(i, 0)).collect();
+    let on_y_axis: Vec<BigInt> = (0..=degree).map(|j| c(0, j)).collect();
+    // h(x, 0) or h(0, y) identically zero means y or x divides h.
+    if on_x_axis.iter().all(|x| x.is_zero()) || on_y_axis.iter().all(|x| x.is_zero()) { return true; }
+
+    // Directions (u, v) of linear factors ux + vy of the top form.
+    let top: Vec<BigInt> = (0..=degree).map(|i| c(i, degree - i)).collect();
+    let mut dirs: Vec<(i64, i64)> = Vec::new();
+    if top[0].is_zero() { dirs.push((1, 0)); }
+    if top[degree as usize].is_zero() { dirs.push((0, 1)); }
+    dirs.extend(rational_roots(&top).into_iter().filter(|&(p, _)| p != 0).map(|(p, q)| (q, -p)));
+
+    let big: Vec<BigInt> = coeffs.iter().map(|&x| BigInt::from(x)).collect();
+    dirs.iter().any(|&(u, v)| {
+        if v == 0 {
+            // The line x = a/b meets the x axis where h(x, 0) has a rational root.
+            rational_roots(&on_x_axis).iter().any(|&(a, b)| vanishes_on_rational_line(monos, &big, degree, (a, 0), b, (0, 1)))
+        } else {
+            // The line ux + vy + w = 0 meets the y axis where h(0, y) has a rational root.
+            rational_roots(&on_y_axis).iter().any(|&(a, b)| vanishes_on_rational_line(monos, &big, degree, (0, a), b, (v, -u)))
+        }
+    })
+}
+
+/// Whether the curve vanishes along the line through (origin / b) with the given direction.
+/// Scaling coordinates by b turns the question into one about the integer polynomial with
+/// coefficients c_ij * b^(degree - i - j) along an integer line.
+fn vanishes_on_rational_line(monos: &[Mono], coeffs: &[BigInt], degree: u8, origin: IPoint, b: i64, dir: (i64, i64)) -> bool {
+    let scaled: Vec<BigInt> = monos.iter().zip(coeffs)
+        .map(|(&(i, j), c)| c * BigInt::from(b).pow((degree - i - j) as u32))
+        .collect();
+    let forms = expand_about(origin, monos, &scaled, degree);
+    let (u, v) = (BigInt::from(dir.0 * b), BigInt::from(dir.1 * b));
+    forms.iter().all(|f| eval_form(f, &u, &v).is_zero())
+}
+
+/// Rational roots p/q of the polynomial with the given coefficients (index = power), as
+/// (p, q) with q > 0 in lowest terms. The zero polynomial has none reported.
+fn rational_roots(poly: &[BigInt]) -> Vec<(i64, i64)> {
+    let Some(lo) = poly.iter().position(|c| !c.is_zero()) else { return vec![] };
+    let hi = poly.iter().rposition(|c| !c.is_zero()).unwrap();
+    let mut roots = Vec::new();
+    if lo > 0 { roots.push((0, 1)); }
+    if lo == hi { return roots; }
+    let (Some(trailing), Some(leading)) = (poly[lo].to_i64(), poly[hi].to_i64()) else { return roots };
+    for q in divisors(leading) {
+        for p in divisors(trailing) {
+            if gcd(p, q) != 1 { continue; }
+            for p in [p, -p] {
+                let sum: BigInt = (lo..=hi)
+                    .map(|i| &poly[i] * BigInt::from(p).pow((i - lo) as u32) * BigInt::from(q).pow((hi - i) as u32))
+                    .sum();
+                if sum.is_zero() { roots.push((p, q)); }
+            }
+        }
+    }
+    roots
+}
+
+fn divisors(n: i64) -> Vec<i64> {
+    let n = n.abs();
+    let mut result = Vec::new();
+    let mut d = 1;
+    while d * d <= n {
+        if n % d == 0 {
+            result.push(d);
+            if d * d != n { result.push(n / d); }
+        }
+        d += 1;
+    }
+    result
 }
 
 fn coeff_of(monos: &[Mono], coeffs: &[i64], mono: Mono) -> BigInt {
@@ -513,7 +864,7 @@ fn conic_is_degenerate(monos: &[Mono], coeffs: &[i64]) -> bool {
 /// form vanishes at (u, v). The linear form pins the direction when p is a smooth point; at
 /// a double point the quadratic form has at most two rational roots. A point of multiplicity
 /// three or more is skipped; some other point on the same line is then smooth or double.
-fn has_line_factor_through(p: IPoint, monos: &[Mono], coeffs: &[i64], degree: u8) -> bool {
+fn has_line_factor_through(p: IPoint, monos: &[Mono], coeffs: &[BigInt], degree: u8) -> bool {
     let forms = expand_about(p, monos, coeffs, degree);
     let vanishes = |u: &BigInt, v: &BigInt| forms.iter().all(|f| eval_form(f, u, v).is_zero());
 
@@ -537,10 +888,10 @@ fn has_line_factor_through(p: IPoint, monos: &[Mono], coeffs: &[i64], degree: u8
 
 /// Homogeneous forms of h expanded about p: forms[n][a] is the coefficient of u^a v^(n-a)
 /// in h(p.0 + u, p.1 + v).
-fn expand_about(p: IPoint, monos: &[Mono], coeffs: &[i64], degree: u8) -> Vec<Vec<BigInt>> {
+fn expand_about(p: IPoint, monos: &[Mono], coeffs: &[BigInt], degree: u8) -> Vec<Vec<BigInt>> {
     let mut forms: Vec<Vec<BigInt>> = (0..=degree as usize).map(|n| vec![BigInt::zero(); n + 1]).collect();
-    for (&(i, j), &c) in monos.iter().zip(coeffs) {
-        if c == 0 { continue; }
+    for (&(i, j), c) in monos.iter().zip(coeffs) {
+        if c.is_zero() { continue; }
         let px = binomial_powers(p.0, i);
         let py = binomial_powers(p.1, j);
         for (a, cx) in px.iter().enumerate() {
@@ -674,9 +1025,13 @@ fn dedup_points(points: &[IPoint]) -> Vec<IPoint> {
 mod tests {
     use super::*;
 
+    fn solve_t(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
+        solve(points, max_degree, 0.5)
+    }
+
     #[test]
     fn test_line_through_two_points() {
-        let result = solve(&[(0.0, 0.0), (3.0, 3.0)], 4).unwrap();
+        let result = solve_t(&[(0.0, 0.0), (3.0, 3.0)], 4).unwrap();
         assert_eq!(result.degree, 1);
         assert!(result.equation.contains('x') && result.equation.contains('y'));
         println!("y=x: {}", result.equation);
@@ -684,14 +1039,14 @@ mod tests {
 
     #[test]
     fn test_line_x_plus_y_eq_5() {
-        let result = solve(&[(0.0, 5.0), (5.0, 0.0), (2.0, 3.0)], 4).unwrap();
+        let result = solve_t(&[(0.0, 5.0), (5.0, 0.0), (2.0, 3.0)], 4).unwrap();
         assert_eq!(result.degree, 1);
         println!("x+y=5: {}", result.equation);
     }
 
     #[test]
     fn test_circle() {
-        let result = solve(&[(3.0, 4.0), (4.0, 3.0), (5.0, 0.0), (0.0, 5.0)], 4).unwrap();
+        let result = solve_t(&[(3.0, 4.0), (4.0, 3.0), (5.0, 0.0), (0.0, 5.0)], 4).unwrap();
         println!("circle: {}", result.equation);
         // Should contain x^2 and y^2
         assert!(result.equation.contains("x^2") && result.equation.contains("y^2"));
@@ -699,27 +1054,27 @@ mod tests {
 
     #[test]
     fn test_hyperbola_xy_eq_6() {
-        let result = solve(&[(1.0, 6.0), (2.0, 3.0), (3.0, 2.0), (6.0, 1.0)], 4).unwrap();
+        let result = solve_t(&[(1.0, 6.0), (2.0, 3.0), (3.0, 2.0), (6.0, 1.0)], 4).unwrap();
         println!("xy=6: {}", result.equation);
         assert!(result.equation.contains("x * y"));
     }
 
     #[test]
     fn test_parabola_y_eq_x_squared() {
-        let result = solve(&[(1.0, 1.0), (2.0, 4.0), (3.0, 9.0), (-1.0, 1.0)], 4).unwrap();
+        let result = solve_t(&[(1.0, 1.0), (2.0, 4.0), (3.0, 9.0), (-1.0, 1.0)], 4).unwrap();
         println!("y=x²: {}", result.equation);
     }
 
     #[test]
     fn test_elliptic_curve() {
         // The only conic through these is (y - x - 1)(y + x + 1), so the answer is the cubic.
-        let result = solve(&[(0.0,1.0), (0.0,-1.0), (-1.0,0.0), (2.0,3.0), (2.0,-3.0)], 4).unwrap();
+        let result = solve_t(&[(0.0,1.0), (0.0,-1.0), (-1.0,0.0), (2.0,3.0), (2.0,-3.0)], 4).unwrap();
         assert_eq!(result.equation, "1 + x^3 = y^2");
     }
 
     #[test]
     fn test_points_on_both_axes_give_ellipse_not_xy() {
-        let result = solve(&[(4.0,0.0), (-4.0,0.0), (0.0,2.0), (0.0,-2.0)], 4).unwrap();
+        let result = solve_t(&[(4.0,0.0), (-4.0,0.0), (0.0,2.0), (0.0,-2.0)], 4).unwrap();
         assert_eq!(result.equation, "x^2 + 4 * y^2 = 16");
     }
 
@@ -729,7 +1084,7 @@ mod tests {
         // cubic that is not lives in a two-dimensional null space.
         let pts = [(0, 1), (1, 1), (2, 1), (0, -1), (1, -1), (2, -1)];
         let fpts: Vec<(f64, f64)> = pts.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
-        let result = solve(&fpts, 4).unwrap();
+        let result = solve_t(&fpts, 4).unwrap();
         assert_eq!(result.degree, 3);
         assert!(!is_reducible(&pts, &result.monomials, &result.coefficients));
     }
@@ -739,7 +1094,7 @@ mod tests {
         // The unique cubic through these has nine-digit coefficients. The line x = 4 times a
         // smaller cubic through the other six points must not win by default.
         let pts = [(-9.0,3.0), (-2.0,5.0), (0.0,1.0), (2.0,-4.0), (3.0,6.0), (4.0,9.0), (4.0,4.0), (4.0,0.0), (7.0,5.0)];
-        let result = solve(&pts, 4).unwrap();
+        let result = solve_t(&pts, 4).unwrap();
         assert_eq!(result.degree, 3);
         assert_eq!(result.coefficients.iter().map(|c| c.abs()).max(), Some(161831344));
         assert_eq!(
@@ -751,7 +1106,7 @@ mod tests {
     #[test]
     fn test_eleven_scattered_points_give_a_quartic() {
         let pts = [(1.0,2.0), (3.0,5.0), (-2.0,4.0), (5.0,-1.0), (0.0,7.0), (-4.0,-3.0), (6.0,6.0), (2.0,-5.0), (-6.0,1.0), (7.0,3.0), (-3.0,-7.0)];
-        let result = solve(&pts, 4).unwrap();
+        let result = solve_t(&pts, 4).unwrap();
         assert_eq!(result.degree, 4);
     }
 
@@ -777,8 +1132,69 @@ mod tests {
     fn test_only_reducible_curves_fall_back() {
         // Five points on each axis: every curve of degree at most 4 is divisible by x * y.
         let pts: Vec<_> = (1..=5).map(|i| (i as f64, 0.0)).chain((1..=5).map(|i| (0.0, i as f64))).collect();
-        let result = solve(&pts, 4).unwrap();
+        let result = solve(&pts, 4, 0.0).unwrap();
         assert_eq!(result.equation, "x * y = 0");
+        // Within half a unit the circle about (3, 3) passes all ten, and it is irreducible.
+        let result = solve_t(&pts, 4).unwrap();
+        assert_eq!(result.equation, "7 + x^2 + y^2 = 6 * x + 6 * y");
+    }
+
+    #[test]
+    fn test_approximate_circle_beats_exact_conic() {
+        // Five points, one of them off the circle x^2 + y^2 = 25 by 0.099, so the exact
+        // conic through them has a four-digit coefficient.
+        let pts = [(5.0, 0.0), (0.0, 5.0), (-5.0, 0.0), (3.0, 4.0), (1.0, -5.0)];
+        let exact = solve(&pts, 4, 0.0).unwrap();
+        assert_eq!(exact.equation, "15 * y + 145 * x^2 + 142 * y^2 = 3625 + x * y");
+        let result = solve_t(&pts, 4).unwrap();
+        assert_eq!(result.equation, "x^2 + y^2 = 25");
+    }
+
+    #[test]
+    fn test_presentable_exact_curve_survives_tolerance() {
+        // Four points near the circle have an exact three-term conic, which stands.
+        let pts = [(5.0, 0.0), (0.0, 5.0), (-5.0, 0.0), (1.0, -5.0)];
+        assert_eq!(solve_t(&pts, 4).unwrap().equation, solve(&pts, 4, 0.0).unwrap().equation);
+        // The five points of y^2 = x^3 + 1 lie within half a unit of a hyperbola.
+        let pts = [(0.0, 1.0), (0.0, -1.0), (-1.0, 0.0), (2.0, 3.0), (2.0, -3.0)];
+        assert_eq!(solve_t(&pts, 4).unwrap().equation, "1 + x^3 = y^2");
+    }
+
+    #[test]
+    fn test_approximate_shifted_circle_beats_exact_cubic() {
+        // (x - 3)^2 + (y - 2)^2 = 25 with (8, 2) nudged to (8, 3).
+        let pts = [(8.0, 3.0), (3.0, 7.0), (-2.0, 2.0), (3.0, -3.0), (7.0, 5.0), (-1.0, 5.0)];
+        let exact = solve(&pts, 4, 0.0).unwrap();
+        assert_eq!(exact.degree, 3);
+        let result = solve_t(&pts, 4).unwrap();
+        assert_eq!(result.equation, "x^2 + y^2 = 12 + 6 * x + 4 * y");
+    }
+
+    #[test]
+    fn test_exact_line_through_two_points_survives_tolerance() {
+        // x^2 = 3y passes within 0.24 of both points with two terms, but the exact line is
+        // presentable and stands.
+        let result = solve_t(&[(-3.0, 3.0), (4.0, 6.0)], 4).unwrap();
+        assert_eq!(result.equation, "7 * y = 30 + 3 * x");
+    }
+
+    #[test]
+    fn test_small_line_factors() {
+        // (y - x^2)(x - 3) = x y - 3 y - x^3 + 3 x^2
+        assert!(is_reducible_small(&[(1, 1), (0, 1), (3, 0), (2, 0)], &[1, -3, -1, 3]));
+        // (2x + y - 1)(x^2 + y^2 - 4): a slanted line factor meeting the y axis at 1
+        assert!(is_reducible_small(
+            &[(3, 0), (2, 1), (1, 2), (0, 3), (2, 0), (1, 1), (0, 2), (1, 0), (0, 1), (0, 0)],
+            &[2, 1, 2, 1, -1, 0, -1, -8, -4, 4],
+        ));
+        // x y (x - y): three lines through the origin
+        assert!(is_reducible_small(&[(2, 1), (1, 2)], &[1, -1]));
+        // y = x^3 and y^2 = x^3 + 1 are irreducible
+        assert!(!is_reducible_small(&[(0, 1), (3, 0)], &[1, -1]));
+        assert!(!is_reducible_small(&[(0, 2), (3, 0), (0, 0)], &[1, -1, -1]));
+        // x y = 6 is irreducible; x y = 0 is not
+        assert!(!is_reducible_small(&[(1, 1), (0, 0)], &[1, -6]));
+        assert!(is_reducible_small(&[(1, 1)], &[1]));
     }
 
     #[test]
@@ -869,33 +1285,33 @@ mod tests {
 
     #[test]
     fn test_cubic_y_eq_x_cubed() {
-        let result = solve(&[(1.0, 1.0), (2.0, 8.0), (-1.0, -1.0), (0.0, 0.0)], 4).unwrap();
+        let result = solve_t(&[(1.0, 1.0), (2.0, 8.0), (-1.0, -1.0), (0.0, 0.0)], 4).unwrap();
         println!("y=x³: {}", result.equation);
     }
 
     #[test]
     fn test_line_arbitrary_slope() {
         // y = 3x/7 + 30/7, or 7y - 3x = 30
-        let result = solve(&[(-3.0, 3.0), (4.0, 6.0)], 4).unwrap();
+        let result = solve_t(&[(-3.0, 3.0), (4.0, 6.0)], 4).unwrap();
         println!("line -3,3 to 4,6: {}", result.equation);
         assert_eq!(result.degree, 1);
     }
 
     #[test]
     fn test_horizontal_line() {
-        let result = solve(&[(0.0, 3.0), (5.0, 3.0), (-3.0, 3.0)], 4).unwrap();
+        let result = solve_t(&[(0.0, 3.0), (5.0, 3.0), (-3.0, 3.0)], 4).unwrap();
         println!("y=3: {}", result.equation);
     }
 
     #[test]
     fn test_vertical_line() {
-        let result = solve(&[(5.0, 0.0), (5.0, 3.0), (5.0, -2.0)], 4).unwrap();
+        let result = solve_t(&[(5.0, 0.0), (5.0, 3.0), (5.0, -2.0)], 4).unwrap();
         println!("x=5: {}", result.equation);
     }
 
     #[test]
     fn test_half_integer_line() {
-        let result = solve(&[(0.5, 0.5), (2.5, 2.5)], 4).unwrap();
+        let result = solve_t(&[(0.5, 0.5), (2.5, 2.5)], 4).unwrap();
         println!("half y=x: {} (scale={})", result.equation, result.scale);
         assert_eq!(result.scale, 2.0);
         assert_eq!(result.degree, 1);
@@ -903,7 +1319,7 @@ mod tests {
 
     #[test]
     fn test_half_integer_circle() {
-        let result = solve(&[(1.5, 2.0), (2.0, 1.5), (2.5, 0.0), (0.0, 2.5)], 4).unwrap();
+        let result = solve_t(&[(1.5, 2.0), (2.0, 1.5), (2.5, 0.0), (0.0, 2.5)], 4).unwrap();
         println!("half circle: {} (scale={})", result.equation, result.scale);
         assert_eq!(result.scale, 2.0);
     }
@@ -911,7 +1327,7 @@ mod tests {
     #[test]
     fn test_half_integer_5_points() {
         // 5 points on y=x^2 at half-integer x values
-        let result = solve(&[(0.5, 0.25), (1.0, 1.0), (1.5, 2.25), (2.0, 4.0), (-1.5, 2.25)], 4).unwrap();
+        let result = solve_t(&[(0.5, 0.25), (1.0, 1.0), (1.5, 2.25), (2.0, 4.0), (-1.5, 2.25)], 4).unwrap();
         println!("half parabola: {} (scale={})", result.equation, result.scale);
     }
 }

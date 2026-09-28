@@ -15,6 +15,7 @@ For degree d, an implicit curve has `N(d) = (d+1)(d+2)/2` possible monomial term
 3. Computes its **integer coefficients exactly**, however large they get: nine scattered points give a cubic with nine-digit coefficients rather than nothing
 4. Verifies with exact integer arithmetic
 5. Skips curves that split into lower-degree pieces, so five points on `y² = x³ + 1` get the cubic rather than the pair of lines `y = ±(x + 1)`. A product of lines is returned only when nothing else fits within degree 4.
+6. When the exact curve is unwieldy (more than five terms, or a coefficient of four or more digits), looks for a curve of at most five small integer terms that passes within the grey circle around every point, and shows it if it is simpler. Five points placed by hand on a circle get `x² + y² = 25` rather than the exact conic through their grid positions. An exact curve that is already short stands, so two points still get the line through them.
 
 This naturally produces elegant results:
 - `x² + y² = 25` for a circle (not some ugly equivalent)
@@ -29,7 +30,7 @@ This naturally produces elegant results:
 | 3 | 10 | Cubics (elliptic curves) | 4-9 |
 | 4 | 15 | Quartics | 5-14 |
 
-Performance: **under a millisecond** for typical queries, about 10ms for eleven scattered points. Monomial subsets are walked by the terms they exclude, with rank tests modulo a 61-bit prime, and the walk stops once the exclusions rule out every null vector. Exact big-integer arithmetic runs only on the vectors that survive. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
+Performance: **under a millisecond** for typical queries, about 10ms for eleven scattered points. Monomial subsets are walked by the terms they exclude, with rank tests modulo a 61-bit prime, and the walk stops once the exclusions rule out every null vector. Exact big-integer arithmetic runs only on the vectors that survive. The within-tolerance search runs only after an unwieldy exact result and adds at most about 0.7ms. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
 
 ## Architecture
 
@@ -46,7 +47,7 @@ web/
   worker.js    WASM bridge
 ```
 
-Total Rust: ~900 lines. Dependencies: wasm-bindgen and the num crates for big integers.
+Total Rust: ~1300 lines. Dependencies: wasm-bindgen and the num crates for big integers.
 
 ## Development
 
