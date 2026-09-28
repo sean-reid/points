@@ -14,6 +14,7 @@ For degree d, an implicit curve has `N(d) = (d+1)(d+2)/2` possible monomial term
 2. Finds the **sparsest null vector** — the curve with fewest terms
 3. Rationalizes to **smallest integer coefficients**
 4. Verifies with exact integer arithmetic
+5. Skips curves that split into lower-degree pieces, so five points on `y² = x³ + 1` get the cubic rather than the pair of lines `y = ±(x + 1)`. A product of lines is returned only when nothing else fits within degree 4.
 
 This naturally produces elegant results:
 - `x² + y² = 25` for a circle (not some ugly equivalent)
@@ -28,14 +29,14 @@ This naturally produces elegant results:
 | 3 | 10 | Cubics (elliptic curves) | 4-9 |
 | 4 | 15 | Quartics | 5-14 |
 
-Performance: **< 1ms** for any query. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
+Performance: **< 1ms** for typical queries, tens of milliseconds when ten or more points force a quartic. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
 
 ## Architecture
 
 ```
 src/
   lib.rs       WASM entry point (~30 lines)
-  solver.rs    Core algorithm: Vandermonde → null space → sparsest integers (~490 lines)
+  solver.rs    Core algorithm: Vandermonde → null space → sparsest irreducible integer curve
 web/
   index.html   Minimal shell
   style.css    Responsive styles
@@ -45,12 +46,12 @@ web/
   worker.js    WASM bridge
 ```
 
-Total Rust: ~520 lines. No external dependencies beyond wasm-bindgen.
+Total Rust: ~720 lines. No external dependencies beyond wasm-bindgen.
 
 ## Development
 
 ```bash
-cargo test --release                          # Run tests (10 tests, <1s)
+cargo test --release                          # Run tests
 wasm-pack build --target web --out-dir web/pkg  # Build WASM into web/
 cd web && python3 -m http.server 8080         # Open http://localhost:8080
 ```

@@ -1,9 +1,8 @@
 //! Core solver: find the simplest implicit algebraic curve through a set of 2D points.
 //!
-//! Approach: for increasing polynomial degree d, build the monomial Vandermonde matrix,
-//! find the sparsest integer null vector — that's the curve equation.
-//!
-//! This is a pure linear algebra problem, not a combinatorial search.
+//! Approach: for increasing polynomial degree d, build the monomial Vandermonde matrix and
+//! find the sparsest integer null vector that is irreducible over the rationals. A product
+//! of lower-degree curves is only returned when nothing else fits within the degree cap.
 
 /// A monomial x^i * y^j, represented as (i, j).
 pub type Mono = (u8, u8);
@@ -50,44 +49,50 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
         }
     }
 
+    // Sparsest reducible curve, keyed by (degree, terms, score). Returned only when no
+    // irreducible curve exists within max_degree.
+    let mut fallback: Option<((u8, usize, u64), Vec<i64>, Vec<Mono>)> = None;
+
     for d in 1..=max_degree {
         let monos = all_monomials(d);
         let n_mono = monos.len();
-        let n_pts = pts.len();
 
         // Build Vandermonde matrix: M[point][monomial] = x^i * y^j
         let mat = build_vandermonde(&pts, &monos);
 
         // Search for the sparsest null vector, starting from fewest terms
-        for k in 2..=n_mono {
+        for k in 1..=n_mono {
             let mut best: Option<(Vec<i64>, Vec<usize>)> = None;
             let mut best_score = u64::MAX;
 
             // Enumerate all k-subsets of monomials
             let subsets = combinations(n_mono, k);
             for subset in &subsets {
-                // Extract submatrix M_S
                 let sub_mat = extract_columns(&mat, subset);
+                let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
 
-                // Find null vector of sub_mat (if rank < k)
-                if let Some(null_vec) = find_null_vector(&sub_mat) {
-                    // Rationalize to integers
-                    if let Some(int_vec) = rationalize(&null_vec) {
-                        // Verify with exact integer arithmetic
-                        let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
-                        if verify_exact(&pts, &sub_monos, &int_vec) {
-                            // Skip if all non-constant coefficients are zero
-                            let has_vars = subset.iter().zip(int_vec.iter())
-                                .any(|(&mi, &c)| c != 0 && monos[mi] != (0, 0));
-                            if !has_vars { continue; }
+                for int_vec in integer_null_vectors(&sub_mat) {
+                    // A zero entry means a smaller subset, already searched, carries this curve.
+                    if int_vec.iter().any(|&c| c == 0) { continue; }
+                    if !verify_exact(&pts, &sub_monos, &int_vec) { continue; }
 
-                            // Score: prefer fewer terms, smaller coefficients
-                            let score = score_curve(&int_vec, &sub_monos);
-                            if score < best_score {
-                                best_score = score;
-                                best = Some((int_vec.clone(), subset.clone()));
-                            }
+                    // Skip if all non-constant coefficients are zero
+                    let has_vars = sub_monos.iter().zip(&int_vec)
+                        .any(|(&m, &c)| c != 0 && m != (0, 0));
+                    if !has_vars { continue; }
+
+                    // Score: prefer fewer terms, smaller coefficients
+                    let score = score_curve(&int_vec, &sub_monos);
+                    if is_reducible(&pts, &sub_monos, &int_vec) {
+                        let key = (d, k, score);
+                        if fallback.as_ref().map_or(true, |(fk, _, _)| key < *fk) {
+                            fallback = Some((key, int_vec, sub_monos.clone()));
                         }
+                        continue;
+                    }
+                    if score < best_score {
+                        best_score = score;
+                        best = Some((int_vec, subset.clone()));
                     }
                 }
             }
@@ -99,7 +104,124 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
         }
     }
 
-    None
+    fallback.map(|((d, _, _), coeffs, monos)| make_result(coeffs, &monos, d, scale))
+}
+
+// --- Irreducibility over the rationals ---
+
+/// Whether the curve is a product of lower-degree curves over the rationals.
+/// A conic is reducible iff its matrix is singular. For higher degrees the test looks for a
+/// line factor: its direction is a rational root of the top-degree form, and it passes through
+/// one of the points, since otherwise the cofactor alone would have fit at a lower degree.
+/// A quartic that is a product of two conics with no line factor is not detected.
+fn is_reducible(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64]) -> bool {
+    let degree = monos.iter().zip(coeffs)
+        .filter(|(_, &c)| c != 0)
+        .map(|(&(i, j), _)| i + j)
+        .max().unwrap_or(0);
+    match degree {
+        0 | 1 => false,
+        2 => conic_is_degenerate(monos, coeffs),
+        _ => has_line_factor(points, monos, coeffs, degree),
+    }
+}
+
+fn coeff_of(monos: &[Mono], coeffs: &[i64], mono: Mono) -> i128 {
+    monos.iter().zip(coeffs)
+        .find(|(&m, _)| m == mono)
+        .map_or(0, |(_, &c)| c as i128)
+}
+
+fn conic_is_degenerate(monos: &[Mono], coeffs: &[i64]) -> bool {
+    let a = coeff_of(monos, coeffs, (2, 0));
+    let b = coeff_of(monos, coeffs, (1, 1));
+    let c = coeff_of(monos, coeffs, (0, 2));
+    let d = coeff_of(monos, coeffs, (1, 0));
+    let e = coeff_of(monos, coeffs, (0, 1));
+    let f = coeff_of(monos, coeffs, (0, 0));
+    // Determinant of the doubled symmetric matrix [[2a, b, d], [b, 2c, e], [d, e, 2f]].
+    let det = 2 * a * (4 * c * f - e * e) - b * (2 * b * f - e * d) + d * (b * e - 2 * c * d);
+    det == 0
+}
+
+fn has_line_factor(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64], degree: u8) -> bool {
+    // top[i] is the coefficient of x^i y^(degree-i).
+    let top: Vec<i128> = (0..=degree)
+        .map(|i| coeff_of(monos, coeffs, (i, degree - i)))
+        .collect();
+
+    let mut dirs: Vec<(i128, i128)> = Vec::new();
+    if top[degree as usize] == 0 { dirs.push((1, 0)); }
+    if top[0] == 0 { dirs.push((0, 1)); }
+    dirs.extend(nonzero_rational_roots(&top));
+
+    points.iter().any(|&(x, y)| {
+        let origin = (x.round() as i128, y.round() as i128);
+        dirs.iter().any(|&dir| vanishes_on_line(monos, coeffs, origin, dir))
+    })
+}
+
+/// Rational roots p/q, with p and q nonzero, of the polynomial with the given coefficients
+/// (index = power), returned as (p, q).
+fn nonzero_rational_roots(poly: &[i128]) -> Vec<(i128, i128)> {
+    let lo = match poly.iter().position(|&c| c != 0) { Some(i) => i, None => return vec![] };
+    let hi = poly.iter().rposition(|&c| c != 0).unwrap();
+    if lo == hi { return vec![]; }
+
+    let mut roots = Vec::new();
+    for q in divisors(poly[hi]) {
+        for p in divisors(poly[lo]) {
+            if gcd(p as i64, q as i64) != 1 { continue; }
+            for p in [p, -p] {
+                let sum: i128 = (lo..=hi)
+                    .map(|i| poly[i] * pow_i128(p, (i - lo) as u32) * pow_i128(q, (hi - i) as u32))
+                    .sum();
+                if sum == 0 { roots.push((p, q)); }
+            }
+        }
+    }
+    roots
+}
+
+fn divisors(n: i128) -> Vec<i128> {
+    let n = n.abs();
+    let mut result = Vec::new();
+    let mut d = 1;
+    while d * d <= n {
+        if n % d == 0 {
+            result.push(d);
+            if d * d != n { result.push(n / d); }
+        }
+        d += 1;
+    }
+    result
+}
+
+/// Whether the curve vanishes identically along the line origin + t * dir.
+fn vanishes_on_line(monos: &[Mono], coeffs: &[i64], origin: (i128, i128), dir: (i128, i128)) -> bool {
+    let mut total: Vec<i128> = Vec::new();
+    for (&(i, j), &c) in monos.iter().zip(coeffs) {
+        if c == 0 { continue; }
+        let term = poly_mul(&binomial_powers(origin.0, dir.0, i), &binomial_powers(origin.1, dir.1, j));
+        if total.len() < term.len() { total.resize(term.len(), 0); }
+        for (k, &v) in term.iter().enumerate() { total[k] += c as i128 * v; }
+    }
+    total.iter().all(|&c| c == 0)
+}
+
+/// Coefficients in t of (a + b t)^n.
+fn binomial_powers(a: i128, b: i128, n: u8) -> Vec<i128> {
+    let mut result = vec![1];
+    for _ in 0..n { result = poly_mul(&result, &[a, b]); }
+    result
+}
+
+fn poly_mul(p: &[i128], q: &[i128]) -> Vec<i128> {
+    let mut result = vec![0; p.len() + q.len() - 1];
+    for (i, &a) in p.iter().enumerate() {
+        for (j, &b) in q.iter().enumerate() { result[i + j] += a * b; }
+    }
+    result
 }
 
 // --- Grid scale detection ---
@@ -145,12 +267,35 @@ fn build_vandermonde(points: &[(f64, f64)], monos: &[Mono]) -> Vec<Vec<f64>> {
 
 // --- Null space computation via Gaussian elimination ---
 
-/// Find a non-trivial null vector of the matrix (nrows × ncols, nrows < ncols ideally).
-/// Returns None if the matrix has full column rank.
-fn find_null_vector(mat: &[Vec<f64>]) -> Option<Vec<f64>> {
+/// Integer null vectors of the matrix worth scoring as curves.
+/// A one-dimensional null space gives its single vector. In a larger null space every
+/// basis vector has a zero at another free column, so it lives in a smaller monomial subset
+/// already searched; the vectors new to this subset are combinations with every basis
+/// coefficient nonzero, and the signed sums stand in for the whole family.
+fn integer_null_vectors(mat: &[Vec<f64>]) -> Vec<Vec<i64>> {
+    let basis: Vec<Vec<i64>> = null_space_basis(mat).iter()
+        .filter_map(|v| rationalize(v))
+        .collect();
+    let m = basis.len();
+    if m <= 1 { return basis; }
+
+    // Sign patterns with the first basis vector positive, the rest free.
+    (0..1u32 << (m - 1)).map(|signs| {
+        let mut sum = vec![0i64; basis[0].len()];
+        for (i, b) in basis.iter().enumerate() {
+            let w = if i > 0 && signs >> (i - 1) & 1 == 1 { -1 } else { 1 };
+            for (s, &x) in sum.iter_mut().zip(b) { *s += w * x; }
+        }
+        let g = sum.iter().fold(0i64, |acc, &x| gcd(acc, x));
+        if g > 1 { for s in sum.iter_mut() { *s /= g; } }
+        sum
+    }).collect()
+}
+
+/// Basis of the null space of the matrix (nrows × ncols), one vector per free column.
+fn null_space_basis(mat: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let nrows = mat.len();
-    let ncols = if nrows == 0 { return None; } else { mat[0].len() };
-    if ncols < 2 { return None; }
+    let ncols = if nrows == 0 { return vec![]; } else { mat[0].len() };
 
     // Augmented matrix for elimination
     let mut m: Vec<Vec<f64>> = mat.to_vec();
@@ -196,22 +341,15 @@ fn find_null_vector(mat: &[Vec<f64>]) -> Option<Vec<f64>> {
         row += 1;
     }
 
-    let rank = pivot_cols.len();
-    if rank >= ncols { return None; } // Full rank, no null space
-
-    // Find a free column (not a pivot column)
-    let pivot_set: Vec<bool> = (0..ncols).map(|c| pivot_cols.contains(&c)).collect();
-    let free_col = (0..ncols).find(|&c| !pivot_set[c])?;
-
-    // Build null vector: set free variable to 1, solve for pivot variables
-    let mut null_vec = vec![0.0; ncols];
-    null_vec[free_col] = 1.0;
-
-    for (r, &pc) in pivot_cols.iter().enumerate() {
-        null_vec[pc] = -m[r][free_col];
-    }
-
-    Some(null_vec)
+    // One null vector per free column, with the other free columns held at zero.
+    (0..ncols).filter(|c| !pivot_cols.contains(c)).map(|free_col| {
+        let mut null_vec = vec![0.0; ncols];
+        null_vec[free_col] = 1.0;
+        for (r, &pc) in pivot_cols.iter().enumerate() {
+            null_vec[pc] = -m[r][free_col];
+        }
+        null_vec
+    }).collect()
 }
 
 // --- Rationalization: float vector → integer vector ---
@@ -480,10 +618,59 @@ mod tests {
 
     #[test]
     fn test_elliptic_curve() {
-        // y² = x³ + 1: points (0,1), (0,-1), (-1,0), (2,3), (2,-3)
+        // The only conic through these is (y - x - 1)(y + x + 1), so the answer is the cubic.
         let result = solve(&[(0.0,1.0), (0.0,-1.0), (-1.0,0.0), (2.0,3.0), (2.0,-3.0)], 4).unwrap();
-        println!("elliptic y²=x³+1: {}", result.equation);
-        assert!(result.equation.contains("x^3") || result.equation.contains("y^2"));
+        assert_eq!(result.equation, "1 + x^3 = y^2");
+    }
+
+    #[test]
+    fn test_points_on_both_axes_give_ellipse_not_xy() {
+        let result = solve(&[(4.0,0.0), (-4.0,0.0), (0.0,2.0), (0.0,-2.0)], 4).unwrap();
+        assert_eq!(result.equation, "x^2 + 4 * y^2 = 16");
+    }
+
+    #[test]
+    fn test_two_parallel_lines_give_irreducible_cubic() {
+        // Every conic and every sparse cubic through these is a product of lines, and the
+        // cubic that is not lives in a two-dimensional null space.
+        let pts = [(0.0,1.0), (1.0,1.0), (2.0,1.0), (0.0,-1.0), (1.0,-1.0), (2.0,-1.0)];
+        let result = solve(&pts, 4).unwrap();
+        assert_eq!(result.degree, 3);
+        assert!(!is_reducible(&pts, &result.monomials, &result.coefficients));
+    }
+
+    #[test]
+    fn test_only_reducible_curves_fall_back() {
+        // Five points on each axis: every curve of degree at most 4 is divisible by x * y.
+        let pts: Vec<_> = (1..=5).map(|i| (i as f64, 0.0)).chain((1..=5).map(|i| (0.0, i as f64))).collect();
+        let result = solve(&pts, 4).unwrap();
+        assert_eq!(result.equation, "x * y = 0");
+    }
+
+    #[test]
+    fn test_degenerate_conics() {
+        let m = all_monomials(2);
+        // y^2 - x^2 - 2x - 1
+        assert!(conic_is_degenerate(&m, &[-1, -2, 0, -1, 0, 1]));
+        // x * y
+        assert!(conic_is_degenerate(&m, &[0, 0, 0, 0, 1, 0]));
+        // x^2 + y^2 - 25
+        assert!(!conic_is_degenerate(&m, &[-25, 0, 0, 1, 0, 1]));
+        // y - x^2
+        assert!(!conic_is_degenerate(&m, &[0, 0, 1, -1, 0, 0]));
+    }
+
+    #[test]
+    fn test_line_factors_in_cubics() {
+        let pts = [(0.0,1.0), (0.0,-1.0), (-1.0,0.0), (2.0,3.0), (2.0,-3.0)];
+        // 2xy - x^2 y = x * y * (2 - x)
+        assert!(is_reducible(&pts, &[(1, 1), (2, 1)], &[2, -1]));
+        // (x + y + 1)(x^2 + y^2 - 1), line through (0, -1) in a slanted direction
+        assert!(is_reducible(&[(0.0, -1.0)], &[(3, 0), (2, 1), (1, 2), (0, 3), (2, 0), (0, 2), (1, 0), (0, 1), (0, 0)], &[1, 1, 1, 1, 1, 1, -1, -1, -1]));
+        // y^2 - x^3 - 1
+        assert!(!is_reducible(&pts, &[(0, 2), (3, 0), (0, 0)], &[1, -1, -1]));
+        // y^2 - x^3 - x^2: singular but irreducible
+        assert!(!is_reducible(&[(0.0, 0.0), (-1.0, 0.0)], &[(0, 2), (3, 0), (2, 0)], &[1, -1, -1]));
     }
 
     #[test]
