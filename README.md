@@ -29,7 +29,7 @@ This naturally produces elegant results:
 | 3 | 10 | Cubics (elliptic curves) | 4-9 |
 | 4 | 15 | Quartics | 5-14 |
 
-Performance: **a few milliseconds** for typical queries, about 100ms when ten or more points force a full search at degree 4. Rank tests run modulo a 61-bit prime over every monomial subset; exact big-integer arithmetic runs only on the vectors that survive. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
+Performance: **under a millisecond** for typical queries, about 10ms for eleven scattered points. Monomial subsets are walked by the terms they exclude, with rank tests modulo a 61-bit prime, and the walk stops once the exclusions rule out every null vector. Exact big-integer arithmetic runs only on the vectors that survive. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ web/
   worker.js    WASM bridge
 ```
 
-Total Rust: ~900 lines. Dependencies: wasm-bindgen and the num crates for big integers and rationals.
+Total Rust: ~900 lines. Dependencies: wasm-bindgen and the num crates for big integers.
 
 ## Development
 
