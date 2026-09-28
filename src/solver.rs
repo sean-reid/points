@@ -456,23 +456,17 @@ fn pow_i128(base: i128, exp: u32) -> i128 {
 // --- Elegance scoring ---
 
 /// Score a curve: lower is better. Prefers fewer terms, smaller coefficients,
-/// and curves that use both x and y independently.
+/// and curves that use both x and y.
 fn score_curve(coeffs: &[i64], monos: &[Mono]) -> u64 {
     let n_terms = coeffs.iter().filter(|&&c| c != 0).count() as u64;
     let max_coeff = coeffs.iter().map(|c| c.abs()).max().unwrap_or(0) as u64;
     let coeff_sum = coeffs.iter().map(|c| c.abs()).sum::<i64>() as u64;
 
-    // Prefer both variables used
     let has_x = monos.iter().zip(coeffs).any(|(&(i,_), &c)| i > 0 && c != 0);
     let has_y = monos.iter().zip(coeffs).any(|(&(_,j), &c)| j > 0 && c != 0);
     let var_penalty = if has_x && has_y { 0 } else { 100 };
 
-    // Prefer symmetric use (both x^2 and y^2 present → circle-like)
-    let has_x2 = monos.iter().zip(coeffs).any(|(&(i,j), &c)| i == 2 && j == 0 && c != 0);
-    let has_y2 = monos.iter().zip(coeffs).any(|(&(i,j), &c)| i == 0 && j == 2 && c != 0);
-    let symmetry_bonus = if has_x2 && has_y2 { 0 } else { 10 };
-
-    n_terms * 1000 + coeff_sum + max_coeff + var_penalty + symmetry_bonus
+    n_terms * 1000 + coeff_sum + max_coeff + var_penalty
 }
 
 // --- Equation formatting ---
