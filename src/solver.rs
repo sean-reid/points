@@ -6,7 +6,6 @@
 
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 /// A monomial x^i * y^j, represented as (i, j).
@@ -64,43 +63,33 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
         let n_mono = monos.len();
         let search = DegreeSearch::new(&pts, &monos);
         if search.null_exact.is_empty() { continue; }
+        let supported = search.supported_subsets();
 
-        // Search for the sparsest null vector, starting from fewest terms
+        // Score candidates from fewest terms up; reducibility is only checked from the best
+        // score down until an irreducible curve appears.
         for k in 1..=n_mono {
-            let mut best: Option<(Vec<i64>, Vec<usize>)> = None;
-            let mut best_score = u128::MAX;
-
-            // Enumerate all k-subsets of monomials
-            let subsets = combinations(n_mono, k);
-            for subset in &subsets {
+            let mut scored: Vec<(u128, Vec<i64>, Vec<Mono>)> = Vec::new();
+            for (subset, patterns, modular_dim) in &supported[k] {
                 let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
-
-                for int_vec in search.candidates(subset) {
+                for int_vec in search.exact_candidates(subset, patterns, *modular_dim) {
                     if !verify_exact(&pts, &sub_monos, &int_vec) { continue; }
-
                     // Skip if all non-constant coefficients are zero
                     let has_vars = sub_monos.iter().zip(&int_vec)
                         .any(|(&m, &c)| c != 0 && m != (0, 0));
                     if !has_vars { continue; }
-
-                    // Score: prefer fewer terms, smaller coefficients
-                    let score = score_curve(&int_vec, &sub_monos);
-                    if is_reducible(&pts, &sub_monos, &int_vec) {
-                        let key = (d, k, score);
-                        if fallback.as_ref().map_or(true, |(fk, _, _)| key < *fk) {
-                            fallback = Some((key, int_vec, sub_monos.clone()));
-                        }
-                        continue;
-                    }
-                    if score < best_score {
-                        best_score = score;
-                        best = Some((int_vec, subset.clone()));
-                    }
+                    scored.push((score_curve(&int_vec, &sub_monos), int_vec, sub_monos.clone()));
                 }
             }
+            scored.sort_by_key(|(score, _, _)| *score);
 
-            if let Some((coeffs, subset)) = best {
-                let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
+            for (score, coeffs, sub_monos) in scored {
+                if is_reducible(&pts, &sub_monos, &coeffs) {
+                    let key = (d, k, score);
+                    if fallback.as_ref().map_or(true, |(fk, _, _)| key < *fk) {
+                        fallback = Some((key, coeffs, sub_monos));
+                    }
+                    continue;
+                }
                 return Some(make_result(coeffs, &sub_monos, d, scale));
             }
         }
@@ -150,20 +139,9 @@ fn vandermonde_exact(points: &[IPoint], monos: &[Mono]) -> Vec<Vec<BigInt>> {
     }).collect()
 }
 
-fn vandermonde_mod(points: &[IPoint], monos: &[Mono]) -> Vec<Vec<u64>> {
-    points.iter().map(|&(x, y)| {
-        let (x, y) = (to_mod(x), to_mod(y));
-        monos.iter().map(|&(i, j)| mul_mod(pow_mod(x, i as u64), pow_mod(y, j as u64))).collect()
-    }).collect()
-}
-
 // --- Arithmetic modulo a Mersenne prime ---
 
 const P: u64 = (1 << 61) - 1;
-
-fn to_mod(x: i64) -> u64 {
-    x.rem_euclid(P as i64) as u64
-}
 
 fn add_mod(a: u64, b: u64) -> u64 {
     let s = a + b;
@@ -197,65 +175,98 @@ fn inv_mod(a: u64) -> u64 {
 
 // --- Null space computation ---
 
-/// One degree's Vandermonde matrix and its null space, modular for the rank tests that run
-/// on every monomial subset and exact for the few vectors that survive them.
+/// One degree's Vandermonde matrix and its null space, modular for the rank walk over
+/// monomial subsets and exact for the few vectors that survive it.
 struct DegreeSearch<'a> {
     pts: &'a [IPoint],
     n_mono: usize,
-    mat_mod: Vec<Vec<u64>>,
     mat_exact: Vec<Vec<BigInt>>,
     null_mod: Vec<Vec<u64>>,
     null_exact: Vec<Vec<BigInt>>,
+    /// Monomials some null vector uses; the others are zero in every null vector.
+    active: Vec<usize>,
 }
+
+/// A monomial subset carrying null vectors with full support: the subset, the sign
+/// patterns of its reduced modular basis with full support, and that basis's size.
+type Supported = (Vec<usize>, Vec<u32>, usize);
 
 impl<'a> DegreeSearch<'a> {
     fn new(pts: &'a [IPoint], monos: &[Mono]) -> Self {
         let mat_exact = vandermonde_exact(pts, monos);
         let null_exact = null_space_exact(&mat_exact, monos.len());
-        let null_mod = null_exact.iter()
+        let null_mod: Vec<Vec<u64>> = null_exact.iter()
             .map(|v| v.iter().map(big_to_mod).collect())
             .collect();
-        DegreeSearch {
-            pts,
-            n_mono: monos.len(),
-            mat_mod: vandermonde_mod(pts, monos),
-            mat_exact,
-            null_mod,
-            null_exact,
+        let active = (0..monos.len())
+            .filter(|&c| null_exact.iter().any(|v| !v[c].is_zero()))
+            .collect();
+        DegreeSearch { pts, n_mono: monos.len(), mat_exact, null_mod, null_exact, active }
+    }
+
+    /// Every monomial subset carrying a null vector with full support, grouped by size.
+    /// A subset is walked by the columns it excludes. Its null vectors are the combinations
+    /// of the null basis vanishing on those columns, so each exclusion adds a row to a
+    /// system in nullity unknowns; once the rows reach the nullity nothing survives on any
+    /// superset of the exclusions, and the walk stops there.
+    fn supported_subsets(&self) -> Vec<Vec<Supported>> {
+        let mut found = vec![Vec::new(); self.n_mono + 1];
+        self.walk(0, &mut Vec::new(), &mut Vec::new(), &mut found);
+        found
+    }
+
+    fn walk(
+        &self,
+        start: usize,
+        echelon: &mut Vec<(usize, Vec<u64>)>,
+        excluded: &mut Vec<usize>,
+        found: &mut Vec<Vec<Supported>>,
+    ) {
+        let m = self.null_mod.len();
+        let subset: Vec<usize> = self.active.iter().copied().filter(|c| !excluded.contains(c)).collect();
+        if !subset.is_empty() {
+            let mut basis: Vec<Vec<u64>> = null_space_from_echelon(echelon, m).iter()
+                .map(|c| subset.iter().map(|&s| self.combine_mod(c, s)).collect())
+                .collect();
+            rref_mod(&mut basis);
+            let patterns = full_support_patterns(&basis);
+            if !patterns.is_empty() {
+                found[subset.len()].push((subset, patterns, basis.len()));
+            }
+        }
+
+        for idx in start..self.active.len() {
+            let col = self.active[idx];
+            let row: Vec<u64> = self.null_mod.iter().map(|v| v[col]).collect();
+            let independent = reduce_row(echelon, row);
+            if independent.is_some() && echelon.len() + 1 == m { continue; }
+            let pushed = independent.is_some();
+            if let Some(pivot_row) = independent { echelon.push(pivot_row); }
+            excluded.push(col);
+            self.walk(idx + 1, echelon, excluded, found);
+            excluded.pop();
+            if pushed { echelon.pop(); }
         }
     }
 
-    /// Integer null vectors supported on the monomial subset that are worth scoring.
+    fn combine_mod(&self, c: &[u64], col: usize) -> u64 {
+        self.null_mod.iter().zip(c).fold(0, |acc, (row, &ci)| add_mod(acc, mul_mod(ci, row[col])))
+    }
+
+    /// Exact integer null vectors on the subset for the given sign patterns.
     /// A one-dimensional null space gives its single vector. In a larger one every reduced
     /// basis vector has a zero at another pivot, so it lives in a smaller monomial subset
     /// already searched; the vectors new to this subset are combinations with every basis
     /// coefficient nonzero, and the signed sums stand in for the whole family.
-    /// The modular basis decides which sign patterns have full support; exact arithmetic
-    /// runs only for subsets with at least one.
-    fn candidates(&self, subset: &[usize]) -> Vec<Vec<i64>> {
+    fn exact_candidates(&self, subset: &[usize], patterns: &[u32], modular_dim: usize) -> Vec<Vec<i64>> {
         let k = subset.len();
         let n = self.pts.len();
         let m = self.null_exact.len();
-        let z = self.n_mono - k;
+        let excluded: Vec<usize> = self.active.iter().copied().filter(|c| !subset.contains(c)).collect();
+        let z = excluded.len();
         // Null vectors on the subset are either the null space of the n × k submatrix or
         // the combinations of the degree's null basis that vanish on the z other columns.
         let via_null_basis = z * m * z.min(m) < n * k * n.min(k);
-        let excluded: Vec<usize> = (0..self.n_mono).filter(|c| !subset.contains(c)).collect();
-
-        let basis_mod = if via_null_basis {
-            let b = extract_rows_of_columns(&self.null_mod, &excluded);
-            let mut v: Vec<Vec<u64>> = null_space_mod(&b, m).iter().map(|c| {
-                subset.iter().map(|&s| {
-                    self.null_mod.iter().zip(c).fold(0, |acc, (row, &ci)| add_mod(acc, mul_mod(ci, row[s])))
-                }).collect()
-            }).collect();
-            rref_mod(&mut v);
-            v
-        } else {
-            null_space_mod(&extract_columns(&self.mat_mod, subset), k)
-        };
-        let full_support = full_support_patterns(&basis_mod);
-        if full_support.is_empty() { return vec![]; }
 
         let basis = if via_null_basis {
             let b = extract_rows_of_columns(&self.null_exact, &excluded);
@@ -268,7 +279,7 @@ impl<'a> DegreeSearch<'a> {
         } else {
             null_space_exact(&extract_columns(&self.mat_exact, subset), k)
         };
-        combine_basis(&basis, &full_support, basis_mod.len())
+        combine_basis(&basis, patterns, modular_dim)
     }
 }
 
@@ -349,25 +360,45 @@ fn rref_mod(m: &mut Vec<Vec<u64>>) -> Vec<usize> {
     pivot_cols
 }
 
-/// Basis of the null space modulo P of an nrows × ncols matrix, one vector per free column.
-fn null_space_mod(mat: &[Vec<u64>], ncols: usize) -> Vec<Vec<u64>> {
-    let mut m: Vec<Vec<u64>> = mat.to_vec();
-    let pivot_cols = rref_mod(&mut m);
+/// Reduce a row against the echelon rows; the normalized row and its pivot column if it
+/// is independent of them.
+fn reduce_row(echelon: &[(usize, Vec<u64>)], mut row: Vec<u64>) -> Option<(usize, Vec<u64>)> {
+    for (p, r) in echelon {
+        let f = row[*p];
+        if f == 0 { continue; }
+        for (x, y) in row.iter_mut().zip(r) { *x = sub_mod(*x, mul_mod(f, *y)); }
+    }
+    let pivot = row.iter().position(|&x| x != 0)?;
+    let inv = inv_mod(row[pivot]);
+    for x in row.iter_mut() { *x = mul_mod(*x, inv); }
+    Some((pivot, row))
+}
 
-    (0..ncols).filter(|c| !pivot_cols.contains(c)).map(|free_col| {
-        let mut null_vec = vec![0; ncols];
-        null_vec[free_col] = 1;
-        for (r, &pc) in pivot_cols.iter().enumerate() {
-            null_vec[pc] = sub_mod(0, m[r][free_col]);
+/// Null space modulo P of the echelon rows in `ncols` unknowns, one vector per free column.
+/// Each row is zero at the pivots of the rows before it, so back substitution runs from the
+/// last row to the first.
+fn null_space_from_echelon(echelon: &[(usize, Vec<u64>)], ncols: usize) -> Vec<Vec<u64>> {
+    let pivots: Vec<usize> = echelon.iter().map(|(p, _)| *p).collect();
+    (0..ncols).filter(|c| !pivots.contains(c)).map(|free| {
+        let mut v = vec![0; ncols];
+        v[free] = 1;
+        for (p, r) in echelon.iter().rev() {
+            let s = r.iter().zip(&v).enumerate()
+                .filter(|(i, _)| i != p)
+                .fold(0, |acc, (_, (&ri, &vi))| add_mod(acc, mul_mod(ri, vi)));
+            v[*p] = sub_mod(0, s);
         }
-        null_vec
+        v
     }).collect()
 }
 
-/// Reduce the rows to reduced row echelon form over the rationals; returns the pivot columns.
-fn rref_exact(m: &mut Vec<Vec<BigRational>>) -> Vec<usize> {
+/// Fraction-free Gauss-Jordan elimination (Bareiss). Every update divides by the previous
+/// pivot, which is exact because each entry is a minor of the original matrix. On return
+/// all pivot entries equal the returned scalar. Returns that scalar and the pivot columns.
+fn rref_fraction_free(m: &mut Vec<Vec<BigInt>>) -> (BigInt, Vec<usize>) {
     let nrows = m.len();
-    let ncols = if nrows == 0 { return vec![]; } else { m[0].len() };
+    let ncols = if nrows == 0 { return (BigInt::one(), vec![]); } else { m[0].len() };
+    let mut prev = BigInt::one();
     let mut pivot_cols = Vec::new();
     let mut row = 0;
     for col in 0..ncols {
@@ -377,53 +408,49 @@ fn rref_exact(m: &mut Vec<Vec<BigRational>>) -> Vec<usize> {
         pivot_cols.push(col);
 
         let pivot = m[row][col].clone();
-        for c in 0..ncols { m[row][c] /= &pivot; }
         for r in 0..nrows {
-            if r == row || m[r][col].is_zero() { continue; }
-            let factor = m[r][col].clone();
+            if r == row { continue; }
+            let f = m[r][col].clone();
             for c in 0..ncols {
-                let t = &factor * &m[row][c];
-                m[r][c] -= t;
+                let (q, rem) = (&pivot * &m[r][c] - &f * &m[row][c]).div_rem(&prev);
+                debug_assert!(rem.is_zero());
+                m[r][c] = q;
             }
         }
+        prev = pivot;
         row += 1;
     }
-    pivot_cols
+    (prev, pivot_cols)
 }
 
 /// Basis of the rational null space of an nrows × ncols matrix as primitive integer
 /// vectors, one per free column.
 fn null_space_exact(mat: &[Vec<BigInt>], ncols: usize) -> Vec<Vec<BigInt>> {
-    let mut m: Vec<Vec<BigRational>> = mat.iter()
-        .map(|row| row.iter().map(|x| BigRational::from_integer(x.clone())).collect())
-        .collect();
-    let pivot_cols = rref_exact(&mut m);
+    let mut m = mat.to_vec();
+    let (d, pivot_cols) = rref_fraction_free(&mut m);
 
     (0..ncols).filter(|c| !pivot_cols.contains(c)).map(|free_col| {
-        let mut null_vec = vec![BigRational::zero(); ncols];
-        null_vec[free_col] = BigRational::one();
+        let mut null_vec = vec![BigInt::zero(); ncols];
+        null_vec[free_col] = d.clone();
         for (r, &pc) in pivot_cols.iter().enumerate() {
             null_vec[pc] = -m[r][free_col].clone();
         }
-        primitive(&null_vec)
+        primitive(null_vec)
     }).collect()
 }
 
 /// The rows in reduced row echelon form, each scaled to a primitive integer vector.
-fn rref_exact_rows(rows: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
-    let mut m: Vec<Vec<BigRational>> = rows.iter()
-        .map(|row| row.iter().map(|x| BigRational::from_integer(x.clone())).collect())
-        .collect();
-    let rank = rref_exact(&mut m).len();
-    m[..rank].iter().map(|row| primitive(row)).collect()
+fn rref_exact_rows(mut rows: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
+    let (_, pivot_cols) = rref_fraction_free(&mut rows);
+    rows.truncate(pivot_cols.len());
+    rows.into_iter().map(primitive).collect()
 }
 
-/// Clear denominators and divide out the content.
-fn primitive(v: &[BigRational]) -> Vec<BigInt> {
-    let lcm = v.iter().fold(BigInt::one(), |acc, x| acc.lcm(x.denom()));
-    let ints: Vec<BigInt> = v.iter().map(|x| (x * &lcm).to_integer()).collect();
-    let g = ints.iter().fold(BigInt::zero(), |acc, x| acc.gcd(x));
-    ints.iter().map(|x| x / &g).collect()
+/// Divide out the content.
+fn primitive(v: Vec<BigInt>) -> Vec<BigInt> {
+    let g = v.iter().fold(BigInt::zero(), |acc, x| acc.gcd(x));
+    if g.is_zero() || g.is_one() { return v; }
+    v.into_iter().map(|x| x / &g).collect()
 }
 
 fn big_to_mod(x: &BigInt) -> u64 {
@@ -564,7 +591,11 @@ fn score_curve(coeffs: &[i64], monos: &[Mono]) -> u128 {
 
 // --- Equation formatting ---
 
-fn make_result(coeffs: Vec<i64>, monos: &[Mono], degree: u8, scale: f64) -> CurveResult {
+fn make_result(mut coeffs: Vec<i64>, monos: &[Mono], degree: u8, scale: f64) -> CurveResult {
+    // Orient so the highest-order monomial has a positive coefficient.
+    if coeffs.iter().rev().find(|&&c| c != 0).is_some_and(|&c| c < 0) {
+        for c in coeffs.iter_mut() { *c = -*c; }
+    }
     let equation = format_equation(&coeffs, monos);
     let (nz_coeffs, nz_monos): (Vec<i64>, Vec<Mono>) = coeffs.iter().zip(monos)
         .filter(|(&c, _)| c != 0)
@@ -620,28 +651,6 @@ fn format_monomial(i: u8, j: u8) -> String {
         (i, 1) => format!("x^{} * y", i),
         (1, j) => format!("x * y^{}", j),
         (i, j) => format!("x^{} * y^{}", i, j),
-    }
-}
-
-// --- Subset enumeration ---
-
-fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
-    let mut result = Vec::new();
-    let mut current = Vec::with_capacity(k);
-    combinations_helper(n, k, 0, &mut current, &mut result);
-    result
-}
-
-fn combinations_helper(n: usize, k: usize, start: usize, current: &mut Vec<usize>, result: &mut Vec<Vec<usize>>) {
-    if current.len() == k {
-        result.push(current.clone());
-        return;
-    }
-    let remaining = k - current.len();
-    for i in start..=(n - remaining) {
-        current.push(i);
-        combinations_helper(n, k, i + 1, current, result);
-        current.pop();
     }
 }
 
@@ -747,13 +756,11 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_null_space_matches_modular() {
+    fn test_exact_null_space_is_primitive_and_vanishes() {
         let pts = [(-9, 3), (-2, 5), (0, 1), (2, -4), (3, 6), (4, 9), (4, 4), (4, 0), (7, 5)];
         let monos = all_monomials(4);
         let exact = null_space_exact(&vandermonde_exact(&pts, &monos), monos.len());
-        let modular = null_space_mod(&vandermonde_mod(&pts, &monos), monos.len());
         assert_eq!(exact.len(), 6);
-        assert_eq!(modular.len(), 6);
         for v in &exact {
             for &(x, y) in &pts {
                 let sum: BigInt = monos.iter().zip(v)
@@ -785,6 +792,56 @@ mod tests {
         assert!(!conic_is_degenerate(&m, &[-25, 0, 0, 1, 0, 1]));
         // y - x^2
         assert!(!conic_is_degenerate(&m, &[0, 0, 1, -1, 0, 0]));
+    }
+
+    #[test]
+    fn test_supported_subsets_carry_exact_full_support_vectors() {
+        // Eleven points at degree 4: nullity 4, so at most three exclusions are independent
+        // and the walk visits a few hundred subsets out of 32767.
+        let pts = [(1, 2), (3, 5), (-2, 4), (5, -1), (0, 7), (-4, -3), (6, 6), (2, -5), (-6, 1), (7, 3), (-3, -7)];
+        let monos = all_monomials(4);
+        let search = DegreeSearch::new(&pts, &monos);
+        let supported = search.supported_subsets();
+        let total: usize = supported.iter().map(|b| b.len()).sum();
+        assert!(total > 0 && total < 600, "{total}");
+        for (k, bucket) in supported.iter().enumerate() {
+            for (subset, patterns, dim) in bucket {
+                assert_eq!(subset.len(), k);
+                for v in search.exact_candidates(subset, patterns, *dim) {
+                    assert!(v.iter().all(|&c| c != 0));
+                    let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
+                    assert!(verify_exact(&pts, &sub_monos, &v));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_walk_matches_brute_force() {
+        // Cases with dependent columns, where the walk keeps excluding without gaining rank.
+        let cases: [&[IPoint]; 3] = [
+            &[(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (0, 3)],
+            &[(1, 0), (-1, 0), (0, 1), (0, -1), (2, 0), (-2, 0), (0, 2), (0, -2)],
+            &[(0, 0), (1, 0), (2, 0), (0, 1), (0, 2), (3, 0)],
+        ];
+        for pts in cases {
+            let monos = all_monomials(3);
+            let search = DegreeSearch::new(pts, &monos);
+            let mut walked: Vec<Vec<usize>> = search.supported_subsets().into_iter().flatten().map(|(s, _, _)| s).collect();
+            walked.sort();
+
+            let mut brute = Vec::new();
+            for mask in 1u32..1 << monos.len() {
+                let subset: Vec<usize> = (0..monos.len()).filter(|c| mask >> c & 1 == 1).collect();
+                let basis = null_space_exact(&extract_columns(&search.mat_exact, &subset), subset.len());
+                if basis.is_empty() { continue; }
+                let basis = if basis.len() > 1 { rref_exact_rows(basis) } else { basis };
+                let basis_mod: Vec<Vec<u64>> = basis.iter().map(|v| v.iter().map(big_to_mod).collect()).collect();
+                if !full_support_patterns(&basis_mod).is_empty() { brute.push(subset); }
+            }
+            brute.sort();
+            assert_eq!(walked, brute);
+        }
     }
 
     #[test]
