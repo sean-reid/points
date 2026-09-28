@@ -17,7 +17,7 @@ export class Solver {
             if (e.data.type === 'ready') {
                 this.ready = true;
                 this.onReady();
-                if (this.pending) { this._query(this.pending); this.pending = null; }
+                if (this.pending) { this._query(...this.pending); this.pending = null; }
             } else if (e.data.type === 'result') {
                 this._handleResult(e.data.result);
             }
@@ -45,17 +45,17 @@ export class Solver {
         this.onResult({ equation, coefficients, monomials, scale });
     }
 
-    solve(points) {
+    solve(points, tolerance) {
         clearTimeout(this.debounceTimer);
         if (points.length < 1) { this.onResult(null); return; }
         this.debounceTimer = setTimeout(() => {
-            if (this.ready) this._query(points);
-            else this.pending = points;
+            if (this.ready) this._query(points, tolerance);
+            else this.pending = [points, tolerance];
         }, DEBOUNCE_MS);
     }
 
-    _query(points) {
+    _query(points, tolerance) {
         const text = points.map(p => `${p.x} ${p.y}`).join('\n');
-        this.worker.postMessage({ type: 'query', pointsText: text });
+        this.worker.postMessage({ type: 'query', pointsText: text, tolerance });
     }
 }

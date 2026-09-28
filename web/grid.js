@@ -5,7 +5,7 @@ const GRID_MAX = 10;
 const GRID_RANGE = GRID_MAX - GRID_MIN;
 const SNAP = 1; // Snap to integers
 const SNAP_RADIUS = 0.4; // Tolerance for toggling off an existing point
-const POINT_RADIUS = 0.5; // Visual radius of each point "circle"
+export const POINT_RADIUS = 0.5; // Radius within which the curve must pass each point
 
 export class Grid {
     constructor(canvas, onChange) {
