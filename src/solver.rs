@@ -4,8 +4,16 @@
 //! find the sparsest integer null vector that is irreducible over the rationals. A product
 //! of lower-degree curves is only returned when nothing else fits within the degree cap.
 
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_rational::BigRational;
+use num_traits::{One, Signed, ToPrimitive, Zero};
+
 /// A monomial x^i * y^j, represented as (i, j).
 pub type Mono = (u8, u8);
+
+/// A point scaled onto the integer grid.
+type IPoint = (i64, i64);
 
 /// Result of the solver: an implicit curve h(x,y) = 0 defined by
 /// integer coefficients on a set of monomials.
@@ -32,48 +40,42 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
     // E.g. if points are on a 0.25 grid, scale = 4 so 2.25 → 9.
     let scale = find_scale(points);
     let pts = dedup_points(&points.iter()
-        .map(|&(x, y)| ((x * scale).round(), (y * scale).round()))
+        .map(|&(x, y)| ((x * scale).round() as i64, (y * scale).round() as i64))
         .collect::<Vec<_>>());
     if pts.is_empty() { return None; }
 
     // Single point: return simplest line through it
     if pts.len() == 1 {
         let (x, y) = pts[0];
-        let xi = x.round() as i64;
-        let yi = y.round() as i64;
         // Prefer x = xi or y = yi, whichever is simpler
-        if xi.abs() <= yi.abs() {
-            return Some(make_result(vec![-xi, 1, 0], &all_monomials(1), 1, scale));
+        if x.abs() <= y.abs() {
+            return Some(make_result(vec![-x, 1, 0], &all_monomials(1), 1, scale));
         } else {
-            return Some(make_result(vec![-yi, 0, 1], &all_monomials(1), 1, scale));
+            return Some(make_result(vec![-y, 0, 1], &all_monomials(1), 1, scale));
         }
     }
 
     // Sparsest reducible curve, keyed by (degree, terms, score). Returned only when no
     // irreducible curve exists within max_degree.
-    let mut fallback: Option<((u8, usize, u64), Vec<i64>, Vec<Mono>)> = None;
+    let mut fallback: Option<((u8, usize, u128), Vec<i64>, Vec<Mono>)> = None;
 
     for d in 1..=max_degree {
         let monos = all_monomials(d);
         let n_mono = monos.len();
-
-        // Build Vandermonde matrix: M[point][monomial] = x^i * y^j
-        let mat = build_vandermonde(&pts, &monos);
+        let search = DegreeSearch::new(&pts, &monos);
+        if search.null_exact.is_empty() { continue; }
 
         // Search for the sparsest null vector, starting from fewest terms
         for k in 1..=n_mono {
             let mut best: Option<(Vec<i64>, Vec<usize>)> = None;
-            let mut best_score = u64::MAX;
+            let mut best_score = u128::MAX;
 
             // Enumerate all k-subsets of monomials
             let subsets = combinations(n_mono, k);
             for subset in &subsets {
-                let sub_mat = extract_columns(&mat, subset);
                 let sub_monos: Vec<Mono> = subset.iter().map(|&i| monos[i]).collect();
 
-                for int_vec in integer_null_vectors(&sub_mat) {
-                    // A zero entry means a smaller subset, already searched, carries this curve.
-                    if int_vec.iter().any(|&c| c == 0) { continue; }
+                for int_vec in search.candidates(subset) {
                     if !verify_exact(&pts, &sub_monos, &int_vec) { continue; }
 
                     // Skip if all non-constant coefficients are zero
@@ -107,123 +109,6 @@ pub fn solve(points: &[(f64, f64)], max_degree: u8) -> Option<CurveResult> {
     fallback.map(|((d, _, _), coeffs, monos)| make_result(coeffs, &monos, d, scale))
 }
 
-// --- Irreducibility over the rationals ---
-
-/// Whether the curve is a product of lower-degree curves over the rationals.
-/// A conic is reducible iff its matrix is singular. For higher degrees the test looks for a
-/// line factor: its direction is a rational root of the top-degree form, and it passes through
-/// one of the points, since otherwise the cofactor alone would have fit at a lower degree.
-/// A quartic that is a product of two conics with no line factor is not detected.
-fn is_reducible(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64]) -> bool {
-    let degree = monos.iter().zip(coeffs)
-        .filter(|(_, &c)| c != 0)
-        .map(|(&(i, j), _)| i + j)
-        .max().unwrap_or(0);
-    match degree {
-        0 | 1 => false,
-        2 => conic_is_degenerate(monos, coeffs),
-        _ => has_line_factor(points, monos, coeffs, degree),
-    }
-}
-
-fn coeff_of(monos: &[Mono], coeffs: &[i64], mono: Mono) -> i128 {
-    monos.iter().zip(coeffs)
-        .find(|(&m, _)| m == mono)
-        .map_or(0, |(_, &c)| c as i128)
-}
-
-fn conic_is_degenerate(monos: &[Mono], coeffs: &[i64]) -> bool {
-    let a = coeff_of(monos, coeffs, (2, 0));
-    let b = coeff_of(monos, coeffs, (1, 1));
-    let c = coeff_of(monos, coeffs, (0, 2));
-    let d = coeff_of(monos, coeffs, (1, 0));
-    let e = coeff_of(monos, coeffs, (0, 1));
-    let f = coeff_of(monos, coeffs, (0, 0));
-    // Determinant of the doubled symmetric matrix [[2a, b, d], [b, 2c, e], [d, e, 2f]].
-    let det = 2 * a * (4 * c * f - e * e) - b * (2 * b * f - e * d) + d * (b * e - 2 * c * d);
-    det == 0
-}
-
-fn has_line_factor(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64], degree: u8) -> bool {
-    // top[i] is the coefficient of x^i y^(degree-i).
-    let top: Vec<i128> = (0..=degree)
-        .map(|i| coeff_of(monos, coeffs, (i, degree - i)))
-        .collect();
-
-    let mut dirs: Vec<(i128, i128)> = Vec::new();
-    if top[degree as usize] == 0 { dirs.push((1, 0)); }
-    if top[0] == 0 { dirs.push((0, 1)); }
-    dirs.extend(nonzero_rational_roots(&top));
-
-    points.iter().any(|&(x, y)| {
-        let origin = (x.round() as i128, y.round() as i128);
-        dirs.iter().any(|&dir| vanishes_on_line(monos, coeffs, origin, dir))
-    })
-}
-
-/// Rational roots p/q, with p and q nonzero, of the polynomial with the given coefficients
-/// (index = power), returned as (p, q).
-fn nonzero_rational_roots(poly: &[i128]) -> Vec<(i128, i128)> {
-    let lo = match poly.iter().position(|&c| c != 0) { Some(i) => i, None => return vec![] };
-    let hi = poly.iter().rposition(|&c| c != 0).unwrap();
-    if lo == hi { return vec![]; }
-
-    let mut roots = Vec::new();
-    for q in divisors(poly[hi]) {
-        for p in divisors(poly[lo]) {
-            if gcd(p as i64, q as i64) != 1 { continue; }
-            for p in [p, -p] {
-                let sum: i128 = (lo..=hi)
-                    .map(|i| poly[i] * pow_i128(p, (i - lo) as u32) * pow_i128(q, (hi - i) as u32))
-                    .sum();
-                if sum == 0 { roots.push((p, q)); }
-            }
-        }
-    }
-    roots
-}
-
-fn divisors(n: i128) -> Vec<i128> {
-    let n = n.abs();
-    let mut result = Vec::new();
-    let mut d = 1;
-    while d * d <= n {
-        if n % d == 0 {
-            result.push(d);
-            if d * d != n { result.push(n / d); }
-        }
-        d += 1;
-    }
-    result
-}
-
-/// Whether the curve vanishes identically along the line origin + t * dir.
-fn vanishes_on_line(monos: &[Mono], coeffs: &[i64], origin: (i128, i128), dir: (i128, i128)) -> bool {
-    let mut total: Vec<i128> = Vec::new();
-    for (&(i, j), &c) in monos.iter().zip(coeffs) {
-        if c == 0 { continue; }
-        let term = poly_mul(&binomial_powers(origin.0, dir.0, i), &binomial_powers(origin.1, dir.1, j));
-        if total.len() < term.len() { total.resize(term.len(), 0); }
-        for (k, &v) in term.iter().enumerate() { total[k] += c as i128 * v; }
-    }
-    total.iter().all(|&c| c == 0)
-}
-
-/// Coefficients in t of (a + b t)^n.
-fn binomial_powers(a: i128, b: i128, n: u8) -> Vec<i128> {
-    let mut result = vec![1];
-    for _ in 0..n { result = poly_mul(&result, &[a, b]); }
-    result
-}
-
-fn poly_mul(p: &[i128], q: &[i128]) -> Vec<i128> {
-    let mut result = vec![0; p.len() + q.len() - 1];
-    for (i, &a) in p.iter().enumerate() {
-        for (j, &b) in q.iter().enumerate() { result[i + j] += a * b; }
-    }
-    result
-}
-
 // --- Grid scale detection ---
 
 /// Find the smallest integer scale factor such that all coordinates become integers.
@@ -255,218 +140,432 @@ fn all_monomials(d: u8) -> Vec<Mono> {
     result
 }
 
-// --- Vandermonde matrix ---
+// --- Vandermonde matrices ---
 
-fn build_vandermonde(points: &[(f64, f64)], monos: &[Mono]) -> Vec<Vec<f64>> {
+fn vandermonde_exact(points: &[IPoint], monos: &[Mono]) -> Vec<Vec<BigInt>> {
     points.iter().map(|&(x, y)| {
         monos.iter().map(|&(i, j)| {
-            x.powi(i as i32) * y.powi(j as i32)
+            BigInt::from(x).pow(i as u32) * BigInt::from(y).pow(j as u32)
         }).collect()
     }).collect()
 }
 
-// --- Null space computation via Gaussian elimination ---
-
-/// Integer null vectors of the matrix worth scoring as curves.
-/// A one-dimensional null space gives its single vector. In a larger null space every
-/// basis vector has a zero at another free column, so it lives in a smaller monomial subset
-/// already searched; the vectors new to this subset are combinations with every basis
-/// coefficient nonzero, and the signed sums stand in for the whole family.
-fn integer_null_vectors(mat: &[Vec<f64>]) -> Vec<Vec<i64>> {
-    let basis: Vec<Vec<i64>> = null_space_basis(mat).iter()
-        .filter_map(|v| rationalize(v))
-        .collect();
-    let m = basis.len();
-    if m <= 1 { return basis; }
-
-    // Sign patterns with the first basis vector positive, the rest free.
-    (0..1u32 << (m - 1)).map(|signs| {
-        let mut sum = vec![0i64; basis[0].len()];
-        for (i, b) in basis.iter().enumerate() {
-            let w = if i > 0 && signs >> (i - 1) & 1 == 1 { -1 } else { 1 };
-            for (s, &x) in sum.iter_mut().zip(b) { *s += w * x; }
-        }
-        let g = sum.iter().fold(0i64, |acc, &x| gcd(acc, x));
-        if g > 1 { for s in sum.iter_mut() { *s /= g; } }
-        sum
+fn vandermonde_mod(points: &[IPoint], monos: &[Mono]) -> Vec<Vec<u64>> {
+    points.iter().map(|&(x, y)| {
+        let (x, y) = (to_mod(x), to_mod(y));
+        monos.iter().map(|&(i, j)| mul_mod(pow_mod(x, i as u64), pow_mod(y, j as u64))).collect()
     }).collect()
 }
 
-/// Basis of the null space of the matrix (nrows × ncols), one vector per free column.
-fn null_space_basis(mat: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let nrows = mat.len();
-    let ncols = if nrows == 0 { return vec![]; } else { mat[0].len() };
+// --- Arithmetic modulo a Mersenne prime ---
 
-    // Augmented matrix for elimination
-    let mut m: Vec<Vec<f64>> = mat.to_vec();
+const P: u64 = (1 << 61) - 1;
 
-    // Gaussian elimination with partial pivoting
+fn to_mod(x: i64) -> u64 {
+    x.rem_euclid(P as i64) as u64
+}
+
+fn add_mod(a: u64, b: u64) -> u64 {
+    let s = a + b;
+    if s >= P { s - P } else { s }
+}
+
+fn sub_mod(a: u64, b: u64) -> u64 {
+    if a >= b { a - b } else { a + P - b }
+}
+
+fn mul_mod(a: u64, b: u64) -> u64 {
+    let x = a as u128 * b as u128;
+    let r = ((x & P as u128) + (x >> 61)) as u64;
+    let r = (r & P) + (r >> 61);
+    if r >= P { r - P } else { r }
+}
+
+fn pow_mod(mut base: u64, mut exp: u64) -> u64 {
+    let mut result = 1;
+    while exp > 0 {
+        if exp & 1 == 1 { result = mul_mod(result, base); }
+        base = mul_mod(base, base);
+        exp >>= 1;
+    }
+    result
+}
+
+fn inv_mod(a: u64) -> u64 {
+    pow_mod(a, P - 2)
+}
+
+// --- Null space computation ---
+
+/// One degree's Vandermonde matrix and its null space, modular for the rank tests that run
+/// on every monomial subset and exact for the few vectors that survive them.
+struct DegreeSearch<'a> {
+    pts: &'a [IPoint],
+    n_mono: usize,
+    mat_mod: Vec<Vec<u64>>,
+    mat_exact: Vec<Vec<BigInt>>,
+    null_mod: Vec<Vec<u64>>,
+    null_exact: Vec<Vec<BigInt>>,
+}
+
+impl<'a> DegreeSearch<'a> {
+    fn new(pts: &'a [IPoint], monos: &[Mono]) -> Self {
+        let mat_exact = vandermonde_exact(pts, monos);
+        let null_exact = null_space_exact(&mat_exact, monos.len());
+        let null_mod = null_exact.iter()
+            .map(|v| v.iter().map(big_to_mod).collect())
+            .collect();
+        DegreeSearch {
+            pts,
+            n_mono: monos.len(),
+            mat_mod: vandermonde_mod(pts, monos),
+            mat_exact,
+            null_mod,
+            null_exact,
+        }
+    }
+
+    /// Integer null vectors supported on the monomial subset that are worth scoring.
+    /// A one-dimensional null space gives its single vector. In a larger one every reduced
+    /// basis vector has a zero at another pivot, so it lives in a smaller monomial subset
+    /// already searched; the vectors new to this subset are combinations with every basis
+    /// coefficient nonzero, and the signed sums stand in for the whole family.
+    /// The modular basis decides which sign patterns have full support; exact arithmetic
+    /// runs only for subsets with at least one.
+    fn candidates(&self, subset: &[usize]) -> Vec<Vec<i64>> {
+        let k = subset.len();
+        let n = self.pts.len();
+        let m = self.null_exact.len();
+        let z = self.n_mono - k;
+        // Null vectors on the subset are either the null space of the n × k submatrix or
+        // the combinations of the degree's null basis that vanish on the z other columns.
+        let via_null_basis = z * m * z.min(m) < n * k * n.min(k);
+        let excluded: Vec<usize> = (0..self.n_mono).filter(|c| !subset.contains(c)).collect();
+
+        let basis_mod = if via_null_basis {
+            let b = extract_rows_of_columns(&self.null_mod, &excluded);
+            let mut v: Vec<Vec<u64>> = null_space_mod(&b, m).iter().map(|c| {
+                subset.iter().map(|&s| {
+                    self.null_mod.iter().zip(c).fold(0, |acc, (row, &ci)| add_mod(acc, mul_mod(ci, row[s])))
+                }).collect()
+            }).collect();
+            rref_mod(&mut v);
+            v
+        } else {
+            null_space_mod(&extract_columns(&self.mat_mod, subset), k)
+        };
+        let full_support = full_support_patterns(&basis_mod);
+        if full_support.is_empty() { return vec![]; }
+
+        let basis = if via_null_basis {
+            let b = extract_rows_of_columns(&self.null_exact, &excluded);
+            let v: Vec<Vec<BigInt>> = null_space_exact(&b, m).iter().map(|c| {
+                subset.iter().map(|&s| {
+                    self.null_exact.iter().zip(c).map(|(row, ci)| ci * &row[s]).sum()
+                }).collect()
+            }).collect();
+            if v.len() > 1 { rref_exact_rows(v) } else { v }
+        } else {
+            null_space_exact(&extract_columns(&self.mat_exact, subset), k)
+        };
+        combine_basis(&basis, &full_support, basis_mod.len())
+    }
+}
+
+/// Sign patterns whose modular sum has no zero entry.
+fn full_support_patterns(basis_mod: &[Vec<u64>]) -> Vec<u32> {
+    let m = basis_mod.len();
+    if m == 0 { return vec![]; }
+    let ncols = basis_mod[0].len();
+    (0..1u32 << (m - 1)).filter(|&signs| {
+        (0..ncols).all(|c| {
+            let mut sum = 0;
+            for (i, b) in basis_mod.iter().enumerate() {
+                sum = if sign_is_negative(signs, i) { sub_mod(sum, b[c]) } else { add_mod(sum, b[c]) };
+            }
+            sum != 0
+        })
+    }).collect()
+}
+
+/// Signed sums of the exact basis, reduced to primitive vectors that fit in i64.
+fn combine_basis(basis: &[Vec<BigInt>], full_support: &[u32], modular_dim: usize) -> Vec<Vec<i64>> {
+    // The prime divides a minor with negligible probability, but the exact basis decides.
+    let patterns: Vec<u32> = if basis.len() == modular_dim {
+        full_support.to_vec()
+    } else if basis.is_empty() {
+        return vec![];
+    } else {
+        (0..1u32 << (basis.len() - 1)).collect()
+    };
+
+    let ncols = basis[0].len();
+    patterns.iter().filter_map(|&signs| {
+        let mut sum = vec![BigInt::zero(); ncols];
+        for (i, b) in basis.iter().enumerate() {
+            for (s, x) in sum.iter_mut().zip(b) {
+                if sign_is_negative(signs, i) { *s -= x; } else { *s += x; }
+            }
+        }
+        if sum.iter().any(|x| x.is_zero()) { return None; }
+        let g = sum.iter().fold(BigInt::zero(), |acc, x| acc.gcd(x));
+        sum.iter().map(|x| (x / &g).to_i64()).collect::<Option<Vec<i64>>>()
+    }).collect()
+}
+
+/// Basis vector 0 is always added; the bits of `signs` choose for the rest.
+fn sign_is_negative(signs: u32, i: usize) -> bool {
+    i > 0 && signs >> (i - 1) & 1 == 1
+}
+
+fn extract_rows_of_columns<T: Clone>(mat: &[Vec<T>], cols: &[usize]) -> Vec<Vec<T>> {
+    cols.iter().map(|&c| mat.iter().map(|row| row[c].clone()).collect()).collect()
+}
+
+/// Reduce the rows to reduced row echelon form modulo P; returns the pivot columns.
+fn rref_mod(m: &mut Vec<Vec<u64>>) -> Vec<usize> {
+    let nrows = m.len();
+    let ncols = if nrows == 0 { return vec![]; } else { m[0].len() };
     let mut pivot_cols = Vec::new();
     let mut row = 0;
     for col in 0..ncols {
         if row >= nrows { break; }
-
-        // Find pivot
-        let mut max_val = 0.0f64;
-        let mut max_row = row;
-        for r in row..nrows {
-            if m[r][col].abs() > max_val {
-                max_val = m[r][col].abs();
-                max_row = r;
-            }
-        }
-
-        if max_val < 1e-10 { continue; } // Skip this column (free variable)
-
-        // Swap rows
-        m.swap(row, max_row);
+        let Some(pivot_row) = (row..nrows).find(|&r| m[r][col] != 0) else { continue };
+        m.swap(row, pivot_row);
         pivot_cols.push(col);
 
-        // Eliminate below and above
-        let pivot = m[row][col];
+        let inv = inv_mod(m[row][col]);
+        for c in 0..ncols { m[row][c] = mul_mod(m[row][c], inv); }
         for r in 0..nrows {
-            if r == row { continue; }
-            let factor = m[r][col] / pivot;
+            if r == row || m[r][col] == 0 { continue; }
+            let factor = m[r][col];
             for c in 0..ncols {
-                m[r][c] -= factor * m[row][c];
+                let t = mul_mod(factor, m[row][c]);
+                m[r][c] = sub_mod(m[r][c], t);
             }
-            m[r][col] = 0.0; // Exact zero
         }
-
-        // Normalize pivot row
-        for c in 0..ncols {
-            m[row][c] /= pivot;
-        }
-
         row += 1;
     }
+    pivot_cols
+}
 
-    // One null vector per free column, with the other free columns held at zero.
+/// Basis of the null space modulo P of an nrows × ncols matrix, one vector per free column.
+fn null_space_mod(mat: &[Vec<u64>], ncols: usize) -> Vec<Vec<u64>> {
+    let mut m: Vec<Vec<u64>> = mat.to_vec();
+    let pivot_cols = rref_mod(&mut m);
+
     (0..ncols).filter(|c| !pivot_cols.contains(c)).map(|free_col| {
-        let mut null_vec = vec![0.0; ncols];
-        null_vec[free_col] = 1.0;
+        let mut null_vec = vec![0; ncols];
+        null_vec[free_col] = 1;
         for (r, &pc) in pivot_cols.iter().enumerate() {
-            null_vec[pc] = -m[r][free_col];
+            null_vec[pc] = sub_mod(0, m[r][free_col]);
         }
         null_vec
     }).collect()
 }
 
-// --- Rationalization: float vector → integer vector ---
+/// Reduce the rows to reduced row echelon form over the rationals; returns the pivot columns.
+fn rref_exact(m: &mut Vec<Vec<BigRational>>) -> Vec<usize> {
+    let nrows = m.len();
+    let ncols = if nrows == 0 { return vec![]; } else { m[0].len() };
+    let mut pivot_cols = Vec::new();
+    let mut row = 0;
+    for col in 0..ncols {
+        if row >= nrows { break; }
+        let Some(pivot_row) = (row..nrows).find(|&r| !m[r][col].is_zero()) else { continue };
+        m.swap(row, pivot_row);
+        pivot_cols.push(col);
 
-/// Convert a float vector to an integer vector by finding a common scaling factor.
-fn rationalize(v: &[f64]) -> Option<Vec<i64>> {
-    // Find the best rational approximation for each non-zero entry
-    let mut denominators = Vec::new();
-    for &x in v {
-        if x.abs() < 1e-10 { continue; }
-        let (_, d) = best_rational(x, 10000);
-        denominators.push(d);
+        let pivot = m[row][col].clone();
+        for c in 0..ncols { m[row][c] /= &pivot; }
+        for r in 0..nrows {
+            if r == row || m[r][col].is_zero() { continue; }
+            let factor = m[r][col].clone();
+            for c in 0..ncols {
+                let t = &factor * &m[row][c];
+                m[r][c] -= t;
+            }
+        }
+        row += 1;
     }
-
-    if denominators.is_empty() { return None; }
-
-    // LCM of all denominators
-    let mut lcm = 1i64;
-    for &d in &denominators {
-        lcm = lcm / gcd(lcm, d) * d;
-        if lcm > 100000 { return None; } // Denominator too large
-    }
-
-    // Scale and round
-    let scaled: Vec<i64> = v.iter().map(|&x| {
-        (x * lcm as f64).round() as i64
-    }).collect();
-
-    // Divide by GCD of all entries
-    let g = scaled.iter().fold(0i64, |acc, &x| gcd(acc, x.abs()));
-    if g == 0 { return None; }
-
-    let result: Vec<i64> = scaled.iter().map(|&x| x / g).collect();
-
-    // Check coefficients are reasonable
-    if result.iter().any(|&x| x.abs() > 100000) { return None; }
-
-    Some(result)
+    pivot_cols
 }
 
-/// Best rational approximation p/q of x with |q| ≤ max_q, via continued fractions.
-fn best_rational(x: f64, max_q: i64) -> (i64, i64) {
-    let sign = if x < 0.0 { -1 } else { 1 };
-    let x = x.abs();
+/// Basis of the rational null space of an nrows × ncols matrix as primitive integer
+/// vectors, one per free column.
+fn null_space_exact(mat: &[Vec<BigInt>], ncols: usize) -> Vec<Vec<BigInt>> {
+    let mut m: Vec<Vec<BigRational>> = mat.iter()
+        .map(|row| row.iter().map(|x| BigRational::from_integer(x.clone())).collect())
+        .collect();
+    let pivot_cols = rref_exact(&mut m);
 
-    let mut p0 = 0i64;
-    let mut q0 = 1i64;
-    let mut p1 = 1i64;
-    let mut q1 = 0i64;
-
-    let mut val = x;
-    for _ in 0..20 {
-        let a = val.floor() as i64;
-        let p2 = a * p1 + p0;
-        let q2 = a * q1 + q0;
-
-        if q2 > max_q { break; }
-
-        p0 = p1; q0 = q1;
-        p1 = p2; q1 = q2;
-
-        let frac = val - a as f64;
-        if frac.abs() < 1e-12 { break; }
-        val = 1.0 / frac;
-    }
-
-    if q1 == 0 { (0, 1) } else { (sign * p1, q1) }
+    (0..ncols).filter(|c| !pivot_cols.contains(c)).map(|free_col| {
+        let mut null_vec = vec![BigRational::zero(); ncols];
+        null_vec[free_col] = BigRational::one();
+        for (r, &pc) in pivot_cols.iter().enumerate() {
+            null_vec[pc] = -m[r][free_col].clone();
+        }
+        primitive(&null_vec)
+    }).collect()
 }
 
-fn gcd(mut a: i64, mut b: i64) -> i64 {
-    a = a.abs(); b = b.abs();
-    while b != 0 { let t = b; b = a % b; a = t; }
-    a
+/// The rows in reduced row echelon form, each scaled to a primitive integer vector.
+fn rref_exact_rows(rows: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
+    let mut m: Vec<Vec<BigRational>> = rows.iter()
+        .map(|row| row.iter().map(|x| BigRational::from_integer(x.clone())).collect())
+        .collect();
+    let rank = rref_exact(&mut m).len();
+    m[..rank].iter().map(|row| primitive(row)).collect()
+}
+
+/// Clear denominators and divide out the content.
+fn primitive(v: &[BigRational]) -> Vec<BigInt> {
+    let lcm = v.iter().fold(BigInt::one(), |acc, x| acc.lcm(x.denom()));
+    let ints: Vec<BigInt> = v.iter().map(|x| (x * &lcm).to_integer()).collect();
+    let g = ints.iter().fold(BigInt::zero(), |acc, x| acc.gcd(x));
+    ints.iter().map(|x| x / &g).collect()
+}
+
+fn big_to_mod(x: &BigInt) -> u64 {
+    x.mod_floor(&BigInt::from(P)).to_u64().unwrap()
 }
 
 // --- Exact integer verification ---
 
 /// Verify that the curve passes through all points using exact integer arithmetic.
-/// Points should already be scaled to integers.
-fn verify_exact(points: &[(f64, f64)], monos: &[Mono], coeffs: &[i64]) -> bool {
-    for &(px, py) in points {
-        let x = px.round() as i64;
-        let y = py.round() as i64;
-
-        let mut sum: i128 = 0;
-        for (k, &(i, j)) in monos.iter().enumerate() {
-            let term = coeffs[k] as i128
-                * pow_i128(x as i128, i as u32)
-                * pow_i128(y as i128, j as u32);
-            sum += term;
-        }
-
-        if sum != 0 { return false; }
-    }
-    true
+fn verify_exact(points: &[IPoint], monos: &[Mono], coeffs: &[i64]) -> bool {
+    points.iter().all(|&(x, y)| {
+        let sum: BigInt = monos.iter().zip(coeffs).map(|(&(i, j), &c)| {
+            BigInt::from(c) * BigInt::from(x).pow(i as u32) * BigInt::from(y).pow(j as u32)
+        }).sum();
+        sum.is_zero()
+    })
 }
 
-fn pow_i128(base: i128, exp: u32) -> i128 {
-    let mut result = 1i128;
-    for _ in 0..exp { result *= base; }
+// --- Irreducibility over the rationals ---
+
+/// Whether the curve is a product of lower-degree curves over the rationals.
+/// A conic is reducible iff its matrix is singular. For higher degrees the test looks for a
+/// line factor through one of the points, since a factor through none of them would leave
+/// the cofactor alone fitting at a lower degree. A quartic that is a product of two conics
+/// with no line factor is not detected.
+fn is_reducible(points: &[IPoint], monos: &[Mono], coeffs: &[i64]) -> bool {
+    let degree = monos.iter().zip(coeffs)
+        .filter(|(_, &c)| c != 0)
+        .map(|(&(i, j), _)| i + j)
+        .max().unwrap_or(0);
+    match degree {
+        0 | 1 => false,
+        2 => conic_is_degenerate(monos, coeffs),
+        _ => points.iter().any(|&p| has_line_factor_through(p, monos, coeffs, degree)),
+    }
+}
+
+fn coeff_of(monos: &[Mono], coeffs: &[i64], mono: Mono) -> BigInt {
+    monos.iter().zip(coeffs)
+        .find(|(&m, _)| m == mono)
+        .map_or(BigInt::zero(), |(_, &c)| BigInt::from(c))
+}
+
+fn conic_is_degenerate(monos: &[Mono], coeffs: &[i64]) -> bool {
+    let a = coeff_of(monos, coeffs, (2, 0));
+    let b = coeff_of(monos, coeffs, (1, 1));
+    let c = coeff_of(monos, coeffs, (0, 2));
+    let d = coeff_of(monos, coeffs, (1, 0));
+    let e = coeff_of(monos, coeffs, (0, 1));
+    let f = coeff_of(monos, coeffs, (0, 0));
+    // Determinant of the doubled symmetric matrix [[2a, b, d], [b, 2c, e], [d, e, 2f]].
+    let two = BigInt::from(2);
+    let det = &two * &a * (&two * &two * &c * &f - &e * &e) - &b * (&two * &b * &f - &e * &d) + &d * (&b * &e - &two * &c * &d);
+    det.is_zero()
+}
+
+/// Whether some line through the point divides the curve.
+/// Along a line through p in direction (u, v), h(p + t(u, v)) is a polynomial in t whose
+/// t^n coefficient is the degree-n form of h expanded about p. The line divides h iff every
+/// form vanishes at (u, v). The linear form pins the direction when p is a smooth point; at
+/// a double point the quadratic form has at most two rational roots. A point of multiplicity
+/// three or more is skipped; some other point on the same line is then smooth or double.
+fn has_line_factor_through(p: IPoint, monos: &[Mono], coeffs: &[i64], degree: u8) -> bool {
+    let forms = expand_about(p, monos, coeffs, degree);
+    let vanishes = |u: &BigInt, v: &BigInt| forms.iter().all(|f| eval_form(f, u, v).is_zero());
+
+    let (hx, hy) = (&forms[1][1], &forms[1][0]);
+    if !hx.is_zero() || !hy.is_zero() {
+        return vanishes(hy, &-hx);
+    }
+
+    let (a, b, c) = (&forms[2][2], &forms[2][1], &forms[2][0]);
+    if a.is_zero() {
+        if b.is_zero() && c.is_zero() { return false; }
+        return vanishes(&BigInt::one(), &BigInt::zero()) || (!b.is_zero() && vanishes(c, &-b));
+    }
+    let disc = b * b - BigInt::from(4) * a * c;
+    if disc.is_negative() { return false; }
+    let s = disc.sqrt();
+    if &s * &s != disc { return false; }
+    let two_a = BigInt::from(2) * a;
+    vanishes(&(-b + &s), &two_a) || vanishes(&(-b - &s), &two_a)
+}
+
+/// Homogeneous forms of h expanded about p: forms[n][a] is the coefficient of u^a v^(n-a)
+/// in h(p.0 + u, p.1 + v).
+fn expand_about(p: IPoint, monos: &[Mono], coeffs: &[i64], degree: u8) -> Vec<Vec<BigInt>> {
+    let mut forms: Vec<Vec<BigInt>> = (0..=degree as usize).map(|n| vec![BigInt::zero(); n + 1]).collect();
+    for (&(i, j), &c) in monos.iter().zip(coeffs) {
+        if c == 0 { continue; }
+        let px = binomial_powers(p.0, i);
+        let py = binomial_powers(p.1, j);
+        for (a, cx) in px.iter().enumerate() {
+            for (b, cy) in py.iter().enumerate() {
+                forms[a + b][a] += c * cx * cy;
+            }
+        }
+    }
+    forms
+}
+
+/// Coefficients of (x0 + u)^n as a polynomial in u.
+fn binomial_powers(x0: i64, n: u8) -> Vec<BigInt> {
+    let mut result = vec![BigInt::one()];
+    for _ in 0..n {
+        let mut next = vec![BigInt::zero(); result.len() + 1];
+        for (k, c) in result.iter().enumerate() {
+            next[k] += c * x0;
+            next[k + 1] += c;
+        }
+        result = next;
+    }
     result
+}
+
+fn eval_form(form: &[BigInt], u: &BigInt, v: &BigInt) -> BigInt {
+    let n = form.len() - 1;
+    form.iter().enumerate()
+        .map(|(a, c)| c * u.pow(a as u32) * v.pow((n - a) as u32))
+        .sum()
 }
 
 // --- Elegance scoring ---
 
 /// Score a curve: lower is better. Prefers fewer terms, smaller coefficients,
-/// and curves that use both x and y.
-fn score_curve(coeffs: &[i64], monos: &[Mono]) -> u64 {
-    let n_terms = coeffs.iter().filter(|&&c| c != 0).count() as u64;
-    let max_coeff = coeffs.iter().map(|c| c.abs()).max().unwrap_or(0) as u64;
-    let coeff_sum = coeffs.iter().map(|c| c.abs()).sum::<i64>() as u64;
+/// and curves that use both x and y independently.
+fn score_curve(coeffs: &[i64], monos: &[Mono]) -> u128 {
+    let n_terms = coeffs.iter().filter(|&&c| c != 0).count() as u128;
+    let max_coeff = coeffs.iter().map(|c| c.unsigned_abs() as u128).max().unwrap_or(0);
+    let coeff_sum = coeffs.iter().map(|c| c.unsigned_abs() as u128).sum::<u128>();
 
+    // Prefer both variables used
     let has_x = monos.iter().zip(coeffs).any(|(&(i,_), &c)| i > 0 && c != 0);
     let has_y = monos.iter().zip(coeffs).any(|(&(_,j), &c)| j > 0 && c != 0);
     let var_penalty = if has_x && has_y { 0 } else { 100 };
 
-    n_terms * 1000 + coeff_sum + max_coeff + var_penalty
+    // Prefer symmetric use (both x^2 and y^2 present → circle-like)
+    let has_x2 = monos.iter().zip(coeffs).any(|(&(i,j), &c)| i == 2 && j == 0 && c != 0);
+    let has_y2 = monos.iter().zip(coeffs).any(|(&(i,j), &c)| i == 0 && j == 2 && c != 0);
+    let symmetry_bonus = if has_x2 && has_y2 { 0 } else { 10 };
+
+    n_terms * 1000 + coeff_sum + max_coeff + var_penalty + symmetry_bonus
 }
 
 // --- Equation formatting ---
@@ -495,7 +594,7 @@ fn format_equation(coeffs: &[i64], monos: &[Mono]) -> String {
     for (&c, &(i, j)) in coeffs.iter().zip(monos) {
         if c == 0 { continue; }
         let mono_str = format_monomial(i, j);
-        let abs_c = c.abs();
+        let abs_c = c.unsigned_abs();
 
         let term = if mono_str.is_empty() {
             // Constant term
@@ -552,18 +651,16 @@ fn combinations_helper(n: usize, k: usize, start: usize, current: &mut Vec<usize
     }
 }
 
-fn extract_columns(mat: &[Vec<f64>], cols: &[usize]) -> Vec<Vec<f64>> {
-    mat.iter().map(|row| cols.iter().map(|&c| row[c]).collect()).collect()
+fn extract_columns<T: Clone>(mat: &[Vec<T>], cols: &[usize]) -> Vec<Vec<T>> {
+    mat.iter().map(|row| cols.iter().map(|&c| row[c].clone()).collect()).collect()
 }
 
 // --- Point deduplication ---
 
-fn dedup_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut result = Vec::new();
+fn dedup_points(points: &[IPoint]) -> Vec<IPoint> {
+    let mut result: Vec<IPoint> = Vec::new();
     for &p in points {
-        if !result.iter().any(|&q: &(f64, f64)| (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01) {
-            result.push(p);
-        }
+        if !result.contains(&p) { result.push(p); }
     }
     result
 }
@@ -627,10 +724,52 @@ mod tests {
     fn test_two_parallel_lines_give_irreducible_cubic() {
         // Every conic and every sparse cubic through these is a product of lines, and the
         // cubic that is not lives in a two-dimensional null space.
-        let pts = [(0.0,1.0), (1.0,1.0), (2.0,1.0), (0.0,-1.0), (1.0,-1.0), (2.0,-1.0)];
-        let result = solve(&pts, 4).unwrap();
+        let pts = [(0, 1), (1, 1), (2, 1), (0, -1), (1, -1), (2, -1)];
+        let fpts: Vec<(f64, f64)> = pts.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
+        let result = solve(&fpts, 4).unwrap();
         assert_eq!(result.degree, 3);
         assert!(!is_reducible(&pts, &result.monomials, &result.coefficients));
+    }
+
+    #[test]
+    fn test_nine_points_give_the_exact_cubic() {
+        // The unique cubic through these has nine-digit coefficients. The line x = 4 times a
+        // smaller cubic through the other six points must not win by default.
+        let pts = [(-9.0,3.0), (-2.0,5.0), (0.0,1.0), (2.0,-4.0), (3.0,6.0), (4.0,9.0), (4.0,4.0), (4.0,0.0), (7.0,5.0)];
+        let result = solve(&pts, 4).unwrap();
+        assert_eq!(result.degree, 3);
+        assert_eq!(result.coefficients.iter().map(|c| c.abs()).max(), Some(161831344));
+        assert_eq!(
+            result.equation,
+            "142822992 + 14322552 * x^2 + 67912625 * x * y + 17242003 * y^2 + 231902 * x^3 + 1766349 * y^3 = 96706388 * x + 161831344 * y + 2889412 * x^2 * y + 10051135 * x * y^2"
+        );
+    }
+
+    #[test]
+    fn test_eleven_scattered_points_give_a_quartic() {
+        let pts = [(1.0,2.0), (3.0,5.0), (-2.0,4.0), (5.0,-1.0), (0.0,7.0), (-4.0,-3.0), (6.0,6.0), (2.0,-5.0), (-6.0,1.0), (7.0,3.0), (-3.0,-7.0)];
+        let result = solve(&pts, 4).unwrap();
+        assert_eq!(result.degree, 4);
+    }
+
+    #[test]
+    fn test_exact_null_space_matches_modular() {
+        let pts = [(-9, 3), (-2, 5), (0, 1), (2, -4), (3, 6), (4, 9), (4, 4), (4, 0), (7, 5)];
+        let monos = all_monomials(4);
+        let exact = null_space_exact(&vandermonde_exact(&pts, &monos), monos.len());
+        let modular = null_space_mod(&vandermonde_mod(&pts, &monos), monos.len());
+        assert_eq!(exact.len(), 6);
+        assert_eq!(modular.len(), 6);
+        for v in &exact {
+            for &(x, y) in &pts {
+                let sum: BigInt = monos.iter().zip(v)
+                    .map(|(&(i, j), c)| c * BigInt::from(x).pow(i as u32) * BigInt::from(y).pow(j as u32))
+                    .sum();
+                assert!(sum.is_zero());
+            }
+            let g = v.iter().fold(BigInt::zero(), |acc, x| acc.gcd(x));
+            assert!(g.is_one());
+        }
     }
 
     #[test]
@@ -656,15 +795,25 @@ mod tests {
 
     #[test]
     fn test_line_factors_in_cubics() {
-        let pts = [(0.0,1.0), (0.0,-1.0), (-1.0,0.0), (2.0,3.0), (2.0,-3.0)];
+        let pts = [(0, 1), (0, -1), (-1, 0), (2, 3), (2, -3)];
         // 2xy - x^2 y = x * y * (2 - x)
         assert!(is_reducible(&pts, &[(1, 1), (2, 1)], &[2, -1]));
         // (x + y + 1)(x^2 + y^2 - 1), line through (0, -1) in a slanted direction
-        assert!(is_reducible(&[(0.0, -1.0)], &[(3, 0), (2, 1), (1, 2), (0, 3), (2, 0), (0, 2), (1, 0), (0, 1), (0, 0)], &[1, 1, 1, 1, 1, 1, -1, -1, -1]));
+        assert!(is_reducible(&[(0, -1)], &[(3, 0), (2, 1), (1, 2), (0, 3), (2, 0), (0, 2), (1, 0), (0, 1), (0, 0)], &[1, 1, 1, 1, 1, 1, -1, -1, -1]));
+        // x * y * (x - y) through the origin only: a triple point, so undetected there,
+        // but (1, 0) is a smooth point of the curve on y = 0.
+        assert!(!is_reducible(&[(0, 0)], &[(2, 1), (1, 2)], &[1, -1]));
+        assert!(is_reducible(&[(0, 0), (1, 0)], &[(2, 1), (1, 2)], &[1, -1]));
+        // x * y * (x - y) * (x + y - 2): the origin is a triple point, (1, 1) a double point.
+        assert!(is_reducible(&[(0, 0), (1, 1)], &[(3, 1), (2, 2), (1, 3), (2, 1), (1, 2)], &[1, 0, -1, -2, 2]));
         // y^2 - x^3 - 1
         assert!(!is_reducible(&pts, &[(0, 2), (3, 0), (0, 0)], &[1, -1, -1]));
         // y^2 - x^3 - x^2: singular but irreducible
-        assert!(!is_reducible(&[(0.0, 0.0), (-1.0, 0.0)], &[(0, 2), (3, 0), (2, 0)], &[1, -1, -1]));
+        assert!(!is_reducible(&[(0, 0), (-1, 0)], &[(0, 2), (3, 0), (2, 0)], &[1, -1, -1]));
+        // (x - 4) times the cubic through six of the nine points, with large coefficients
+        let nine = [(-9, 3), (-2, 5), (0, 1), (2, -4), (3, 6), (4, 9), (4, 4), (4, 0), (7, 5)];
+        let monos = [(1,0), (0,1), (2,0), (3,1), (2,2), (0,0), (0,2), (3,0), (2,1), (1,2)];
+        assert!(is_reducible(&nine, &monos, &[57462, 23472, 6277, 1193, 582, -22248, -1224, -4813, -6239, -2022]));
     }
 
     #[test]
