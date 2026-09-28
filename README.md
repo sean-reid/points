@@ -12,7 +12,7 @@ For degree d, an implicit curve has `N(d) = (d+1)(d+2)/2` possible monomial term
 
 1. Builds the monomial matrix M (points × monomials)
 2. Finds the **sparsest null vector** — the curve with fewest terms
-3. Rationalizes to **smallest integer coefficients**
+3. Computes its **integer coefficients exactly**, however large they get: nine scattered points give a cubic with nine-digit coefficients rather than nothing
 4. Verifies with exact integer arithmetic
 5. Skips curves that split into lower-degree pieces, so five points on `y² = x³ + 1` get the cubic rather than the pair of lines `y = ±(x + 1)`. A product of lines is returned only when nothing else fits within degree 4.
 
@@ -29,7 +29,7 @@ This naturally produces elegant results:
 | 3 | 10 | Cubics (elliptic curves) | 4-9 |
 | 4 | 15 | Quartics | 5-14 |
 
-Performance: **< 1ms** for typical queries, tens of milliseconds when ten or more points force a quartic. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
+Performance: **a few milliseconds** for typical queries, about 100ms when ten or more points force a full search at degree 4. Rank tests run modulo a 61-bit prime over every monomial subset; exact big-integer arithmetic runs only on the vectors that survive. No precomputation, no pool files, no enumeration. Just linear algebra on tiny matrices.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ web/
   worker.js    WASM bridge
 ```
 
-Total Rust: ~720 lines. No external dependencies beyond wasm-bindgen.
+Total Rust: ~900 lines. Dependencies: wasm-bindgen and the num crates for big integers and rationals.
 
 ## Development
 
